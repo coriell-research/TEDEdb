@@ -123,7 +123,7 @@ cm <- makeContrasts(
 )
 
 y <- DGEList(counts = counts, samples = metadata)
-keep <- filterByExpr(y, design = design)
+keep <- rowSums(y$counts > 10) >= ncol(y) * 0.7
 y <- y[keep,, keep.lib.sizes = FALSE]
 
 # If global normalization assumptions are violated then perform qsmooth and set

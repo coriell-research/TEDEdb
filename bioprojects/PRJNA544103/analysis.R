@@ -109,7 +109,7 @@ MOLM13.Y220C.Daunorubicin_vs_Y220C.DMSO = MOLM13.Y220C.Daunorubicin - MOLM13.Y22
 )
 
 y <- DGEList(counts = counts, samples = metadata)
-keep <- filterByExpr(y, design = design)
+keep <- rowSums(y$counts > 10) >= ncol(y) * 0.7
 y <- y[keep,, keep.lib.sizes = FALSE]
 
 # If global normalization assumptions are violated then perform qsmooth and set
