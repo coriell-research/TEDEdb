@@ -121,8 +121,19 @@ cm <- makeContrasts(
 )
 
 y <- DGEList(counts = counts, samples = metadata)
-keep <- rowSums(y$counts > 10) >= ncol(y) * 0.7
+L <- min(y$samples$lib.size) / 1e6
+before <- aveLogCPM(y)
+keep <- rowSums(cpm(y) > L) >= (ncol(y) * 0.7)
 y <- y[keep,, keep.lib.sizes = FALSE]
+after <- aveLogCPM(y)
+
+.pardefault <- par()
+png(here(WD, "results", "figures", "abundance-hist.png"), width = 12, height = 6, units = "in", res = 150)
+par(mfrow=c(1, 2))
+hist(before, breaks=100, main="Before Filtering", xlab="AveLogCPM")
+hist(after, breaks=100, main="After Filtering", xlab="AveLogCPM")
+dev.off()
+par(.pardefault)
 
 # If global normalization assumptions are violated then perform qsmooth and set
 #  an offset value for each gene. If not, use TMM scaling factors
