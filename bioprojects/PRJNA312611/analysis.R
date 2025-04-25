@@ -106,9 +106,9 @@ cm <- makeContrasts(
 )
 
 y <- DGEList(counts = counts, samples = metadata)
-L <- min(y$samples$lib.size) / 1e6
+cutoff <- 10 / (min(y$samples$lib.size) / 1e6)
 before <- aveLogCPM(y)
-keep <- rowSums(cpm(y) > L) >= (ncol(y) * 0.7)
+keep <- rowSums(cpm(y) > cutoff) >= (ncol(y) * 0.7)
 y <- y[keep,, keep.lib.sizes = FALSE]
 after <- aveLogCPM(y)
 
