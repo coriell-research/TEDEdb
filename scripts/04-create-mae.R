@@ -1,4 +1,4 @@
-#!/usr/bin/Rscript
+#!/usr/bin/env Rscript
 #
 # Create a MultiAssayExperiment object a user supplied annotation file
 # and the quant.sf files for each sample processed by the REdiscoverTE pipeline.
@@ -9,26 +9,27 @@ suppressMessages(library(optparse, warn.conflicts = FALSE, quietly = TRUE))
 suppressMessages(library(data.table, warn.conflicts = FALSE, quietly = TRUE))
 suppressMessages(library(MultiAssayExperiment, warn.conflicts = FALSE, quietly = TRUE))
 suppressMessages(library(tximport, warn.conflicts = FALSE, quietly = TRUE))
+suppressMessages(library(jsonlite, warn.conflicts = FALSE, quietly = TRUE))
 
 # get commandline arguments
 option_list <- list(
   make_option(c("-d", "--quants_dir"),
-    type = "character",
-    default = NULL,
-    help = "Path to quants/ directory containing sub-directories for each SAMPLE",
-    metavar = "quants_dir"
+              type = "character",
+              default = NULL,
+              help = "Path to quants/ directory containing sub-directories for each SAMPLE",
+              metavar = "quants_dir"
   ),
   make_option(c("-f", "--annotation"),
-    type = "character",
-    default = NULL,
-    help = "Path to annotation file. Must at least contain a column called 'Run' and 'group'. Other metadata is optional",
-    metavar = "annotation"
+              type = "character",
+              default = NULL,
+              help = "Path to annotation file. Must at least contain a column called 'Run' and 'group'. Other metadata is optional",
+              metavar = "annotation"
   ),
   make_option(c("-o", "--out_dir"),
-    type = "character",
-    default = ".",
-    help = "Location to save the final MultiAssayExperiment object RDS file",
-    metavar = "out_dir"
+              type = "character",
+              default = ".",
+              help = "Location to save the final MultiAssayExperiment object RDS file",
+              metavar = "out_dir"
   )
 )
 
@@ -46,6 +47,7 @@ quant_files <- list.files(
   full.names = TRUE
 )
 names(quant_files) <- regmatches(quant_files, regexpr("SRR[0-9]+", quant_files))
+
 txi <- tximport(
   files = quant_files,
   type = "salmon",
@@ -76,15 +78,42 @@ meta_df <- fread(opt$annotation)
 stopifnot("Run" %in% colnames(meta_df))
 stopifnot("group" %in% colnames(meta_df))
 
-# convert to data.frame for colData
+# Collect meta_info from Salmon for each run
+message("Collecting mapping information from Salmon meta_info.json files...")
+meta_files <- list.files(
+  path = opt$quants_dir,
+  pattern = "meta_info.json",
+  recursive = TRUE,
+  full.names = TRUE
+)
+names(meta_files) <- regmatches(meta_files, regexpr("SRR[0-9]+", meta_files))
+
+# Helper function for extracting JSON metadata into a data.table
+getJsonData <- function(x) {
+  jdata <- jsonlite::read_json(x)
+  d <- lapply(jdata, \(x) paste(unlist(x), collapse = "; "))
+  as.data.table(d)
+}
+
+# Collect into a single data.table
+meta_info <- rbindlist(lapply(meta_files, getJsonData), idcol="Run")
+cols <- names(meta_info)[names(meta_info) %like% "num_|frag"]
+meta_info[, (cols) := lapply(.SD, as.numeric), .SDcols = cols]
+meta_info[, percent_mapped := as.numeric(percent_mapped)]
+
+# Join sample annotations and meta_info
+meta_df <- merge(meta_df, meta_info, by="Run", all.x=TRUE)
+
+# Convert to data.frame for colData of MAE
 setDF(meta_df, rownames = meta_df$Run)
 meta_df <- subset(meta_df, select = -Run)
 stopifnot(all(names(quant_files) %in% rownames(meta_df)))
 
-# reorder the metadata to match colnames of matrices
-meta_df <- meta_df[names(quant_files), ]
+# Reorder the metadata to match colnames of matrices
+stopifnot(all(colnames(gene_mat) == colnames(re_mat)))
+meta_df <- meta_df[colnames(gene_mat), ]
 
-# create MultiAssayExperiment object from each assay and metadata
+# Create MultiAssayExperiment object from each assay and metadata
 exp_list <- list(
   "gene counts" = gene_mat,
   "RE counts" = re_mat,
