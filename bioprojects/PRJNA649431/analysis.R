@@ -40,6 +40,51 @@ mae <- readRDS(here(WD, "MultiAssayExperiment.rds"))
 stopifnot("'group' column not found in MAE object metadata" = "group" %in% colnames(colData(mae)))
 stopifnot("'BioSample' column not found in MAE object metadata" = "BioSample" %in% colnames(colData(mae)))
 
+# Get Salmon meta_info by BioSample 
+meta_cols <- c("BioSample", "salmon_version", "library_types", "frag_length_mean", 
+               "frag_length_sd", "num_eq_classes", "num_processed", "num_mapped", 
+               "num_decoy_fragments", "num_dovetail_fragments", "num_fragments_filtered_vm", 
+               "num_alignments_below_threshold_for_mapped_fragments_vm", 
+               "percent_mapped")
+meta_info <- as.data.table(data.frame(colData(mae)[, meta_cols]))
+
+# Collapse by BioSample
+meta_info <- meta_info[, .(
+  salmon_version = paste(unique(salmon_version), collapse=", "),
+  library_types = paste(unique(library_types), collapse = ", "),
+  avg_frag_length_mean = mean(frag_length_mean),
+  min_frag_length_mean = min(frag_length_mean),
+  max_frag_length_mean = max(frag_length_mean),
+  avg_frag_length_sd = mean(frag_length_sd),
+  min_frag_length_sd = min(frag_length_sd),
+  max_frag_length_sd = max(frag_length_sd),
+  avg_num_eq_classes = mean(num_eq_classes),
+  min_num_eq_classes = min(num_eq_classes),
+  max_num_eq_classes = max(num_eq_classes),
+  avg_num_processed = mean(num_processed),
+  min_num_processed = min(num_processed),
+  max_num_processed = max(num_processed),
+  avg_num_mapped = mean(num_mapped),
+  min_num_mapped = min(num_mapped),
+  max_num_mapped = max(num_mapped), 
+  avg_num_decoy_fragments = mean(num_decoy_fragments),
+  min_num_decoy_fragments = min(num_decoy_fragments),
+  max_num_decoy_fragments = max(num_decoy_fragments), 
+  avg_num_dovetail_fragments = mean(num_dovetail_fragments),
+  min_num_dovetail_fragments = min(num_dovetail_fragments),
+  max_num_dovetail_fragments = max(num_dovetail_fragments),
+  avg_num_fragments_filtered_vm = mean(num_fragments_filtered_vm),
+  min_num_fragments_filtered_vm = min(num_fragments_filtered_vm),
+  max_num_fragments_filtered_vm = max(num_fragments_filtered_vm),
+  avg_num_alignments_below_threshold_vm = mean(num_alignments_below_threshold_for_mapped_fragments_vm),
+  min_num_alignments_below_threshold_vm = min(num_alignments_below_threshold_for_mapped_fragments_vm),
+  max_num_alignments_below_threshold_vm = max(num_alignments_below_threshold_for_mapped_fragments_vm),
+  avg_percent_mapped = mean(percent_mapped),
+  min_percent_mapped = min(percent_mapped),
+  max_percent_mapped = max(percent_mapped)), 
+  by = "BioSample"]
+
+
 # Remove outlier sample
 mae <- mae[, mae$BioSample != "SAMN15666597"]
 
@@ -68,6 +113,7 @@ counts <- sumTechReps(counts, ID = mae$BioSample)
 mae$bases <- as.integer(mae$bases)
 metadata <- as.data.table(colData(mae))
 metadata <- unique(metadata[, .(BioSample, group)])
+metadata <- merge(metadata, meta_info, by="BioSample", all.x=TRUE)
 setDF(metadata, rownames = metadata$BioSample)
 metadata <- metadata[colnames(counts), ]
 stopifnot("All rownames of metadata do not match colnames of counts" = all(rownames(metadata) == colnames(counts)))
