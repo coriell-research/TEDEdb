@@ -4,15 +4,18 @@
 # This script will import all SE files from each experiment and extract the DE
 # results into a single SummarizedExperiment object used as the backend database
 # for the Shiny app. Metadata information, annotated manually in Excel, is read
-# in and aligned with columns of the imported DE data in order to create a 
-# finalized SE object.
+# in and aligned with columns of the imported DE data to create a finalized SE 
+# object.
+#
 # ------------------------------------------------------------------------------
 message("Loading libraries...")
 suppressPackageStartupMessages(library(here))
 suppressPackageStartupMessages(library(stringr))
 suppressPackageStartupMessages(library(SummarizedExperiment))
 suppressPackageStartupMessages(library(data.table))
-N_CORES <- 12
+source(here("scripts", "helpers.R"))
+N_CORES <- 32
+
 
 message("Getting all processed SummarizedExperiment files...")
 se_files <- list.files(
@@ -24,11 +27,9 @@ se_files <- list.files(
 names(se_files) <- str_extract(se_files, "PRJNA[0-9]+")
 message("Found ", length(se_files), " results.")
 
+
 # Extract DE results from SE objects and bind into single DT -------------------
-extract_de <- function(fpath) {
-  se <- readRDS(fpath)
-  metadata(se)[["de"]]
-}
+
 
 message("Extracting DE data from SummarizedExperiments...")
 de <- rbindlist(
@@ -39,7 +40,10 @@ de <- rbindlist(
 # Add new column as unique identifier "id"
 de[, id := str_c(BioProject, contrast, sep = ".")]
 
-# Read in previous contrast-level metadata files -------------------------------
+
+# Read in contrast-level metadata files ---------------------------------------
+
+
 message("Reading in contrast-level metadata...")
 metafile <- here("appdata", "contrast-metadata - metadata.tsv")
 drugfile <- here("appdata", "contrast-metadata - drugs.tsv")
@@ -75,14 +79,24 @@ message("Inner joining metadata onto differential expression data...")
 metadata <- metadata[drugs, on = "drug", nomatch = 0L]
 metadata <- metadata[cells, on = "cell_line", nomatch = 0L]
 
+message("Flagging contrasts with potential outliers...")
+outliers <- getOutlierContrasts(se_files, cores = N_CORES)
+metadata[, `:=`(outlier_avg_frag_length_mean = id %chin% outliers$outlier_avg_frag_length_mean,
+                outlier_avg_frag_length_sd = id %chin% outliers$outlier_avg_frag_length_sd,
+                outlier_avg_num_eq_classes = id %chin% outliers$outlier_avg_num_eq_classes,
+                outlier_avg_num_processed = id %chin% outliers$outlier_avg_num_processed,
+                outlier_avg_num_mapped = id %chin% outliers$outlier_avg_num_mapped,
+                outlier_avg_num_decoy_fragments = id %chin% outliers$outlier_avg_num_decoy_fragments,
+                outlier_avg_num_dovetail_fragments = id %chin% outliers$outlier_avg_num_dovetail_fragments,
+                outlier_avg_num_fragments_filtered_vm = id %chin% outliers$outlier_avg_num_fragments_filtered_vm,
+                outlier_avg_num_alignments_below_threshold_vm = id %chin% outliers$outlier_avg_num_alignments_below_threshold_vm,
+                outlier_avg_percent_mapped = id %chin% outliers$outlier_avg_percent_mapped)]
+
+
 # Shape into matrices ----------------------------------------------------------
+
+
 message("Creating assay data from differential expression results...")
-
-col2assay <- function(df, rows, cols, vals) {
-  m <- dcast(df, get(rows) ~ get(cols), value.var = vals, fill = NA)
-  as.matrix(m, rownames = "rows")
-}
-
 assay_cols <- c("logFC", "CI.L", "CI.R", "AveExpr", "t", "P.Value", "adj.P.Val", "z")
 assays <- vector("list", length(assay_cols))
 
@@ -91,7 +105,10 @@ for (i in seq_along(assay_cols)) {
   assays[[i]] <- col2assay(de, rows = "feature_id", cols = "id", vals = assay_cols[[i]])
 }
 
+
 # Create SummarizedExperiment object of DE results -----------------------------
+
+
 setDF(metadata, rownames = metadata$id)
 keep <- intersect(colnames(assays[[1]]), rownames(metadata))
 metadata <- metadata[keep, ]
@@ -99,14 +116,14 @@ assays <- lapply(assays, \(x) x[, keep])
 stopifnot("rownames of metadata do not match colnames of matrices!" = all(colnames(assays[[1]]) == rownames(metadata)))
 
 message("Creating final SummarizedExperiment object from differential expression results...")
-se <- SummarizedExperiment(
-  assays = assays,
-  colData = metadata
-)
+se <- SummarizedExperiment(assays = assays, colData = metadata)
 rowData(se)$feature_type <- fifelse(rownames(se) %like% ".*\\..*\\..*", "TE", "Gene")
 saveRDS(se, here("appdata", "se.rds"), compress = TRUE)
 
+
 # Select input data ---------------------------------------------------------------------------
+
+
 # create data used by the shiny app for populating select inputs
 select_inputs <- lapply(metadata, \(x) sort(unique(x)))
 saveRDS(select_inputs, here("appdata", "select-inputs.rds"))
