@@ -115,29 +115,9 @@ setDF(metadata, rownames = metadata$BioSample)
 metadata <- metadata[colnames(counts), ]
 stopifnot("All rownames of metadata do not match colnames of counts" = all(rownames(metadata) == colnames(counts)))
 
-# cell line in metadata contains missing data 
-
-metadata[metadata$cell.line %in% "",]$cell.line <- "ct.MM.1S"
-#SET DT
-setDT(metadata)
-#Make changes
-metadata[grepl("DMSO", group), group := gsub("..untreated.", "",group)]
-metadata[cell.line %in% "ct.MM.1S", group := gsub("NA.", "",group)]
-metadata[cell.line %in% "ct.MM.1S", group := paste("ct.MM.1S",group, sep = ".")]
-
-#set back to DF
-metadata <- merge(metadata, meta_info, by="BioSample", all.x=TRUE)
-setDF(metadata, rownames = metadata$BioSample)
-
-# remove poorly annotated samples 
-rm_samples<- metadata[!metadata$cell.line %in% "ct.MM.1S",]$BioSample
-#subset metadata
-metadata<- metadata[!metadata$cell.line %in% "ct.MM.1S",]
-#remove from counts 
-counts<- counts[,metadata$BioSample]
-
 
 # Test for global expression differences ----------------------------------
+
 
 # Test for global expression differences between groups
 message("Testing for violations of global scaling normalization...")
@@ -158,17 +138,19 @@ colnames(design) <- gsub(pattern = "^group", replacement = "", x = colnames(desi
 
 # DEFINE CONTRAST MATRIX : THIS MUST BE MODIFIED FOR EACH EXPERIMENT
 cm <- makeContrasts(
-  MM1S.stras.10nM.E7107.24h_vs_stras.DMSO.24h = MM.1S.stras.10.nM.E7107.24.h - MM.1S.stras.DMSO.24.h,
-  MM1S.stras.10uM.melphalan.24h_vs_stras.DMSO.24h = MM.1S.stras.10.uM.melphalan.24.h - MM.1S.stras.DMSO.24.h,
-  MM1S.stras.18nM.carfilzomib.24h_vs_stras.DMSO.24h = MM.1S.stras.18.nM.carfilzomib.24.h - MM.1S.stras.DMSO.24.h,
-  MM1S.tmge.30nM.carfilzomib.8h_vs_tmge.untreated.0h = MM.1S.tmge.30.nM.carfilzomib.8.h - MM.1S.tmge.untreated.0.h..untreated. ,
-  MM1S.tmge.30nM.carfilzomib.16h_vs_tmge.untreated.0h = MM.1S.tmge.30.nM.carfilzomib.16.h - MM.1S.tmge.untreated.0.h..untreated. ,
+  MM1S.stras.10nM.E7107.24h_vs_stras.DMSO.24h = MM.1S.stras.10.nM.E7107.24.h - MM.1S.stras.DMSO.24.h..untreated.,
+  MM1S.stras.10uM.melphalan.24h_vs_stras.DMSO.24h = MM.1S.stras.10.uM.melphalan.24.h - MM.1S.stras.DMSO.24.h..untreated.,
+  MM1S.stras.18nM.carfilzomib.24h_vs_stras.DMSO.24h = MM.1S.stras.18.nM.carfilzomib.24.h - MM.1S.stras.DMSO.24.h..untreated.,
+  
+  MM1S.tmge.30nM.carfilzomib.8h_vs_tmge.untreated.0h = MM.1S.tmge.30.nM.carfilzomib.8.h - MM.1S.tmge.untreated.0.h..untreated.,
+  MM1S.tmge.30nM.carfilzomib.16h_vs_tmge.untreated.0h = MM.1S.tmge.30.nM.carfilzomib.16.h - MM.1S.tmge.untreated.0.h..untreated.,
   MM1S.tmge.30.nM.carfilzomib.24h_vs_tmge.untreated.0h = MM.1S.tmge.30.nM.carfilzomib.24.h  - MM.1S.tmge.untreated.0.h..untreated.,
-  AMO1.eSRSF1SAeas.15nM.carfilzomib.24h_vs_eSRSF1SAeas.DMSO.24h = AMO.1.eSRSF1SAeas.15.nM.carfilzomib.24.h  -  AMO.1.eSRSF1SAeas.DMSO.24.h,
-  AMO1.eSRSF1SDeas.15nM.carfilzomib.24h_vs_eSRSF1SDeas.DMSO.24h = AMO.1.eSRSF1SDeas.15.nM.carfilzomib.24.h - AMO.1.eSRSF1SDeas.DMSO.24.h,
-  AMO1.eSWeas.15nM.carfilzomib.24h_vs_eSWeas.DMSO.24h = AMO.1.eSWeas.15.nM.carfilzomib.24.h - AMO.1.eSWeas.DMSO.24.h ,
-  AMO1.stras.10nM.E7107.24h_vs_stras.DMSO.24h = AMO.1.stras.10.nM.E7107.24.h - AMO.1.stras.DMSO.24.h,
-  AMO.1.stras.15nM.carfilzomib.24h_vs_stras.DMSO.24h = AMO.1.stras.15.nM.carfilzomib.24.h - AMO.1.stras.DMSO.24.h,
+  
+  AMO1.eSRSF1SAeas.15nM.carfilzomib.24h_vs_eSRSF1SAeas.DMSO.24h = AMO.1.eSRSF1SAeas.15.nM.carfilzomib.24.h  -  AMO.1.eSRSF1SAeas.DMSO.24.h..untreated.,
+  AMO1.eSRSF1SDeas.15nM.carfilzomib.24h_vs_eSRSF1SDeas.DMSO.24h = AMO.1.eSRSF1SDeas.15.nM.carfilzomib.24.h - AMO.1.eSRSF1SDeas.DMSO.24.h..untreated.,
+  AMO1.eSWeas.15nM.carfilzomib.24h_vs_eSWeas.DMSO.24h = AMO.1.eSWeas.15.nM.carfilzomib.24.h - AMO.1.eSWeas.DMSO.24.h..untreated.,
+  AMO1.stras.10nM.E7107.24h_vs_stras.DMSO.24h = AMO.1.stras.10.nM.E7107.24.h - AMO.1.stras.DMSO.24.h..untreated.,
+  AMO.1.stras.15nM.carfilzomib.24h_vs_stras.DMSO.24h = AMO.1.stras.15.nM.carfilzomib.24.h - AMO.1.stras.DMSO.24.h..untreated.,
   levels = design
 )
 

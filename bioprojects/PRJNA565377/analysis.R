@@ -130,10 +130,7 @@ qaov_pval <- qaov[["Pr(>F)"]][1]
 
 
 # Differential expression testing -----------------------------------------
-setDT(metadata)
-metadata[grepl("Mithramycin", group), group := paste(group, "100uM", sep = ".")]
-metadata <- merge(metadata, meta_info, by="BioSample", all.x=TRUE)
-setDF(metadata, rownames = metadata$BioSample)
+
 
 # Create experimental design
 message("Differential expression testing pipeline...")
@@ -142,8 +139,8 @@ colnames(design) <- gsub(pattern = "^group", replacement = "", x = colnames(desi
 
 # DEFINE CONTRAST MATRIX : THIS MUST BE MODIFIED FOR EACH EXPERIMENT
 cm <- makeContrasts(
-  BT12.Mithramycin.100uM.18hr_vs_Solvent.18hr = BT12.Mithramycin.18hours.100uM - BT12.Solvent.18hours,
-  BT12.Mithramycin.100uM.8hrs_vs_Solvent.18hr = BT12.Mithramycin.8hours.100uM - BT12.Solvent.18hours,
+  BT12.Mithramycin.100uM.18hr_vs_Solvent.18hr = BT12.Mithramycin.18hours - BT12.Solvent.18hours,
+  BT12.Mithramycin.100uM.8hrs_vs_Solvent.18hr = BT12.Mithramycin.8hours - BT12.Solvent.18hours,
   levels = design
 )
 
