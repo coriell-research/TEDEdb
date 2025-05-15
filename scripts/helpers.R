@@ -3,10 +3,12 @@ extract_de <- function(fpath) {
   metadata(se)[["de"]]
 }
 
+
 col2assay <- function(df, rows, cols, vals) {
   m <- dcast(df, get(rows) ~ get(cols), value.var = vals, fill = NA)
   as.matrix(m, rownames = "rows")
 }
+
 
 getSampleMetadata <- function(x) {
   se <- readRDS(x)
@@ -14,6 +16,7 @@ getSampleMetadata <- function(x) {
   
   return(result)
 }
+
 
 getContrasts <- function(x) {
   se <- readRDS(x)
@@ -30,6 +33,7 @@ getContrasts <- function(x) {
 
   return(cm.m)
 }
+
 
 getOutlierContrasts <- function(sefiles, cores) {
 
@@ -123,5 +127,16 @@ getOutlierContrasts <- function(sefiles, cores) {
                  outlier_avg_num_alignments_below_threshold_vm = con_outlier_avg_num_alignments_below_threshold_vm,
                  outlier_avg_percent_mapped = con_outlier_avg_percent_mapped)
 
+  return(result)
+}
+
+
+getOutlierFlags <- function(l, sep = ",") {
+  mat <- do.call(cbind, l)             
+  result <- apply(mat, 1, function(row) {        
+    cols <- names(l)[which(row)] 
+    paste(cols, collapse = sep)
+  })
+  
   return(result)
 }
