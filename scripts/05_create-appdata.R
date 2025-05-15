@@ -1,4 +1,4 @@
-#!/usr/bin/Rscript
+#!/usr/bin/env Rscript
 # Create combined metadata SummarizedExperiment objects
 #
 # This script will import all SE files from each experiment and extract the DE
@@ -13,6 +13,7 @@ suppressPackageStartupMessages(library(here))
 suppressPackageStartupMessages(library(stringr))
 suppressPackageStartupMessages(library(SummarizedExperiment))
 suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(HDF5Array))
 source(here("scripts", "helpers.R"))
 N_CORES <- 32
 
@@ -92,18 +93,40 @@ metadata[, `:=`(outlier_avg_frag_length_mean = id %chin% outliers$outlier_avg_fr
                 outlier_avg_num_alignments_below_threshold_vm = id %chin% outliers$outlier_avg_num_alignments_below_threshold_vm,
                 outlier_avg_percent_mapped = id %chin% outliers$outlier_avg_percent_mapped)]
 
+# Create a single catch-all flag
+metadata[, outlier_flags := getOutlierFlags(.SD), .SDcols = names(metadata) %like% "outlier"]
+metadata[outlier_flags == "", outlier_flags := "None"]
+
+# Remove the intermediate columns
+metadata[, `:=`(outlier_avg_frag_length_mean=NULL,
+                outlier_avg_frag_length_sd=NULL,
+                outlier_avg_num_eq_classes=NULL,
+                outlier_avg_num_processed=NULL,
+                outlier_avg_num_mapped=NULL,
+                outlier_avg_num_decoy_fragments=NULL,
+                outlier_avg_num_dovetail_fragments=NULL,
+                outlier_avg_num_fragments_filtered_vm=NULL,
+                outlier_avg_num_alignments_below_threshold_vm=NULL,
+                outlier_avg_percent_mapped=NULL
+              )]
+
 
 # Shape into matrices ----------------------------------------------------------
 
 
 message("Creating assay data from differential expression results...")
-assay_cols <- c("logFC", "CI.L", "CI.R", "AveExpr", "t", "P.Value", "adj.P.Val", "z")
+assay_cols <- c("logFC", "AveExpr", "z", "P.Value", "adj.P.Val")
 assays <- vector("list", length(assay_cols))
 
 names(assays) <- assay_cols
 for (i in seq_along(assay_cols)) {
   assays[[i]] <- col2assay(de, rows = "feature_id", cols = "id", vals = assay_cols[[i]])
 }
+
+# Impute missing values for assays used in dim reduction
+assays[["logFC"]][is.na(assays[["logFC"]])] <- 1
+assays[["z"]][is.na(assays[["z"]])] <- 0
+assays[["P.Value"]][is.na(assays[["P.Value"]])] <- 1
 
 
 # Create SummarizedExperiment object of DE results -----------------------------
@@ -119,6 +142,7 @@ message("Creating final SummarizedExperiment object from differential expression
 se <- SummarizedExperiment(assays = assays, colData = metadata)
 rowData(se)$feature_type <- fifelse(rownames(se) %like% ".*\\..*\\..*", "TE", "Gene")
 saveRDS(se, here("appdata", "se.rds"), compress = TRUE)
+saveHDF5SummarizedExperiment(se, dir=here("appdata", "se_hdf5"), replace=TRUE)
 
 
 # Select input data ---------------------------------------------------------------------------
