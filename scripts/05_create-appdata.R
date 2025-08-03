@@ -124,7 +124,7 @@ for (i in seq_along(assay_cols)) {
 }
 
 # Impute missing values for assays used in dim reduction
-assays[["logFC"]][is.na(assays[["logFC"]])] <- 1
+assays[["logFC"]][is.na(assays[["logFC"]])] <- 0
 assays[["z"]][is.na(assays[["z"]])] <- 0
 assays[["P.Value"]][is.na(assays[["P.Value"]])] <- 1
 
