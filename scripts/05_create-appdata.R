@@ -115,7 +115,7 @@ metadata[, `:=`(outlier_avg_frag_length_mean=NULL,
 
 
 message("Creating assay data from differential expression results...")
-assay_cols <- c("logFC", "AveExpr", "z", "P.Value", "adj.P.Val")
+assay_cols <- c("logFC", "AveExpr", "z", "P.Value", "adj.P.Val", "SE")
 assays <- vector("list", length(assay_cols))
 
 names(assays) <- assay_cols
@@ -141,14 +141,15 @@ stopifnot("rownames of metadata do not match colnames of matrices!" = all(colnam
 message("Creating final SummarizedExperiment object from differential expression results...")
 se <- SummarizedExperiment(assays = assays, colData = metadata)
 rowData(se)$feature_type <- fifelse(rownames(se) %like% ".*\\..*\\..*", "TE", "Gene")
-saveRDS(se, here("appdata", "se.rds"), compress = TRUE)
+
+message("Saving HDF5-backed SE for database backend...")
 saveHDF5SummarizedExperiment(se, dir=here("appdata", "se_hdf5"), replace=TRUE)
 
 
 # Select input data ---------------------------------------------------------------------------
 
 
-# create data used by the shiny app for populating select inputs
+# Create data used by the shiny app for populating select inputs
 select_inputs <- lapply(metadata, \(x) sort(unique(x)))
 saveRDS(select_inputs, here("appdata", "select-inputs.rds"))
 message("Appdata creation complete.")
