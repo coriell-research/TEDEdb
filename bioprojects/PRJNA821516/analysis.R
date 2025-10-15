@@ -905,10 +905,11 @@ cm <- makeContrasts(
   levels = design
 )
 
+# This experiment is a special case because of the sample number
 y <- DGEList(counts = counts, samples = metadata)
 cutoff <- 10 / (min(y$samples$lib.size) / 1e6)
 before <- aveLogCPM(y)
-keep <- rowSums(cpm(y) > cutoff) >= (ncol(y) * 0.7)
+keep <- before > 1.2
 y <- y[keep,, keep.lib.sizes = FALSE]
 after <- aveLogCPM(y)
 
