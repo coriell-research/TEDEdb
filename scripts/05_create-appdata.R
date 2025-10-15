@@ -7,7 +7,7 @@
 # in and aligned with columns of the imported DE data to create a finalized SE 
 # object.
 #
-# ------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 message("Loading libraries...")
 suppressPackageStartupMessages(library(here))
 suppressPackageStartupMessages(library(stringr))
@@ -29,7 +29,7 @@ names(se_files) <- str_extract(se_files, "PRJNA[0-9]+")
 message("Found ", length(se_files), " results.")
 
 
-# Extract DE results from SE objects and bind into single DT -------------------
+# Extract DE results from SE objects and bind into single DT -----------------
 
 
 message("Extracting DE data from SummarizedExperiments...")
@@ -42,7 +42,7 @@ de <- rbindlist(
 de[, id := str_c(BioProject, contrast, sep = ".")]
 
 
-# Read in contrast-level metadata files ---------------------------------------
+# Read in contrast-level metadata files --------------------------------------
 
 
 message("Reading in contrast-level metadata...")
@@ -111,7 +111,7 @@ metadata[, `:=`(outlier_avg_frag_length_mean=NULL,
               )]
 
 
-# Shape into matrices ----------------------------------------------------------
+# Shape into matrices --------------------------------------------------------
 
 
 message("Creating assay data from differential expression results...")
@@ -129,7 +129,7 @@ assays[["z"]][is.na(assays[["z"]])] <- 0
 assays[["P.Value"]][is.na(assays[["P.Value"]])] <- 1
 
 
-# Create SummarizedExperiment object of DE results -----------------------------
+# Create SummarizedExperiment object of DE results ---------------------------
 
 
 setDF(metadata, rownames = metadata$id)
@@ -140,13 +140,51 @@ stopifnot("rownames of metadata do not match colnames of matrices!" = all(colnam
 
 message("Creating final SummarizedExperiment object from differential expression results...")
 se <- SummarizedExperiment(assays = assays, colData = metadata)
-rowData(se)$feature_type <- fifelse(rownames(se) %like% ".*\\..*\\..*", "TE", "Gene")
+
+
+# Create rowData -------------------------------------------------------------
+
+
+# TODO: This hardcoded path needs a permanent home in a top-level directory
+#  possibly add the analysis/ directory to the github repo as well
+gene_lengths <- fread("/home/gennaro/data/cancer-rnaseq-database/analysis/results/data-files/01/v26-gene-length-annotation.tsv")
+gene_lengths <- gene_lengths[gene_type == "protein_coding"]
+
+rd <- data.table(feature_name = rownames(se))
+rd <- merge(x = rd, y = gene_lengths, by.x = "feature_name", by.y="gene_name", all.x=TRUE)
+
+# Some gene names are replicated and need to be collapsed (mostly double annotated on PAR Y)
+rd <- rd[!gene_id %like% "PAR_Y"]
+
+# Select the longest of the gene_ids to keep
+multi <- rd[, .N, by=feature_name][N > 1][, feature_name]
+all_ids <- rd[feature_name %chin% multi, unique(gene_id)]
+keep_ids <- rd[feature_name %chin% multi][
+               order(feature_name, -total_gene_length)][, 
+               head(.SD, n=1), by=feature_name][, gene_id]
+drop_ids <- setdiff(all_ids, keep_ids)
+rd <- rd[!gene_id %chin% drop_ids]
+
+# Add feature type labels and separate TE information
+rd[, feature_type := fifelse(feature_name %like% ".*\\..*\\..*", "TE", "Gene")]
+rd[feature_type == "TE", c("class", "family", "subfamily") := tstrsplit(feature_name, "\\.")]
+
+setDF(rd, rownames = rd$feature_name)
+rd$feature_name <- NULL
+
+rd <- rd[rownames(se), ]
+stopifnot("rownames(rowData) != rownames(se)" = all(rownames(rd) == rownames(se)))
+rowData(se) <- cbind(rowData(se), rd)
+
+
+# Save finalized object ------------------------------------------------------
+
 
 message("Saving HDF5-backed SE for database backend...")
 saveHDF5SummarizedExperiment(se, dir=here("appdata", "se_hdf5"), replace=TRUE)
 
 
-# Select input data ---------------------------------------------------------------------------
+# Select input data ----------------------------------------------------------
 
 
 # Create data used by the shiny app for populating select inputs
