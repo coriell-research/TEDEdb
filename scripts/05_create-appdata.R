@@ -87,7 +87,7 @@ if (length(missing_data) > 0) {
 }
 
 message("Inner joining metadata onto differential expression data...")
-metadata <- metadata[drugs, on = "drug", nomatch = 0L]
+metadata <- metadata[drugs, on = "treatment", nomatch = 0L]
 metadata <- metadata[cells, on = "cell_line", nomatch = 0L]
 
 message("Flagging contrasts with potential outliers...")
@@ -202,6 +202,7 @@ keep_ids <- rd[feature_name %chin% multi][
   head(.SD, n = 1),
   by = feature_name
 ][, gene_id]
+
 drop_ids <- setdiff(all_ids, keep_ids)
 rd <- rd[!gene_id %chin% drop_ids]
 
