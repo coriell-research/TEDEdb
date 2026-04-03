@@ -1,4 +1,4 @@
-# GEO Cancer RNAseq Database
+# TEDEdb
 
 Transposable element (TE) expression in cancer is a well defined characteristic of the cancer 
 transcriptome ([source](https://www.nature.com/articles/nrc.2017.35)) however, TE expression is 
@@ -34,9 +34,9 @@ differential expression results into a single database back-end and exposing the
 several novel meta-analysis and visualization functions for the exploration of large-scale patterns 
 of differential expression across datasets. It is also worth mentioning that considerable effort was
 taken to standardize the cell type and drug annotations for all samples in this database. Cell types 
-are given uniform labels from [ATCC](https://www.atcc.org/) and drugs are assigned functional labels 
-from [medchemexpress](https://www.medchemexpress.com/) when available. The code for the actual Shiny 
-application implementation is located in a separate github [repository](https://github.com/coriell-research/dedb).
+are given uniform labels from [Cellosaurus](https://www.cellosaurus.org/) and the [Cancer Cell Line Encyclopedia](https://sites.broadinstitute.org/ccle) and drugs are assigned functional labels 
+from [PubChem](https://pubchem.ncbi.nlm.nih.gov/) and The [Broad Drug Repurposing Hub](https://repo-hub.broadinstitute.org/repurposing#home) when available. The code for the actual Shiny 
+application implementation is located in a separate github [repository](https://github.com/coriell-research/TEDEdb-app).
 The meta-analysis application has been useful for hypothesis generation. For instance, observing 
 drug treatments that result in expression patterns which deviate from other samples in their drug 
 class has led to further studies regarding CDK12 inhibition. 
@@ -53,3 +53,4 @@ repository. Like the appdata above, raw data is housed on the bioinformatics ser
 - scripts/: contains all processing scripts used to download data from SRA and
 process for use in the meta-app. The scripts generally describe the processing steps for a single 
 bioproject.
+- analysis/: contains all analysis scripts for generating figures and data used in the publication
