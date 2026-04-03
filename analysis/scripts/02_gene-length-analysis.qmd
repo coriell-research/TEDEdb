@@ -1,0 +1,177 @@
+---
+title: What is the relationship between gene length and dysregulation?
+author: Gennaro Calendo
+format: html
+---
+
+## Set up 
+
+```{r}
+suppressPackageStartupMessages(library(here))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(SummarizedExperiment))
+
+datafiles <- here("analysis", "results", "data-files", "02")
+figures <- here("analysis", "results", "figures", "02")
+rdsfiles <- here("analysis", "results", "rds-files", "02")
+
+invisible(sapply(c(datafiles, figures, rdsfiles), dir.create, showWarnings=F, recursive=T))
+```
+
+## Load the database backend
+
+```{r}
+se <- HDF5Array::loadHDF5SummarizedExperiment("/home/gennaro/data/cancer-rnaseq-database/appdata/se_hdf5")
+
+# Subset for only genes 
+se <- se[rowData(se)$feature_type == "Gene", ]
+
+# Realize the data into memory since I'm on
+se2 <- SummarizedExperiment(
+    assays = list(
+        "FDR" = as.matrix(assay(se, "adj.P.Val")),
+        "logFC" = as.matrix(assay(se, "logFC"))
+        ),
+    colData = colData(se),
+    rowData = rowData(se) 
+)
+```
+
+## Compute gene length categories
+
+```{r}
+q_tol <- Hmisc::cut2(rowData(se2)$total_gene_length, g=4)
+q_exl <- Hmisc::cut2(rowData(se2)$reduced_exon_lengths, g=4)
+q_mxl <- Hmisc::cut2(rowData(se2)$median_tx_lengths, g=4)
+```
+
+## Classify the differential expression results for each experiment
+
+```{r}
+up_m <- assay(se2, "logFC") > 0 & assay(se2, "FDR") < 0.05
+down_m <- assay(se2, "logFC") < 0 & assay(se2, "FDR") < 0.05
+
+# Mask the missing values in each with NAs
+up_m[is.na(as.matrix(assay(se, "AveExpr")))] <- NA
+down_m[is.na(as.matrix(assay(se, "AveExpr")))] <- NA
+
+# Also get the number of features measured in each
+n_m <- colSums(!is.na(assay(se, "AveExpr")))
+```
+
+Now I want to count the values in each column by their gene length category
+
+```{r}
+countDeByLength <- function(up, down, l) {
+    
+    # Compute counts for each length category
+    up_by_l <- apply(up, 2, \(x) tapply(x, l, sum, na.rm=TRUE), simplify=FALSE)
+    down_by_l <- apply(down, 2, \(x) tapply(x, l, sum, na.rm=TRUE), simplify=FALSE)
+
+    # Bind into data.tables
+    up_by_l <- as.data.table(do.call(rbind, up_by_l), keep.rownames="id")
+    down_by_l <- as.data.table(do.call(rbind, down_by_l), keep.rownames="id")
+
+    # Add total library sizes and compute percentages
+    up_by_l[, lib_size := n_m][, 
+                names(.SD) := lapply(.SD, \(x) x / lib_size * 100), .SDcols = names(up_by_l) %like% "\\["][, 
+                lib_size := NULL]
+    down_by_l[, lib_size := n_m][, 
+                names(.SD) := lapply(.SD, \(x) x / lib_size * 100), .SDcols = names(down_by_l) %like% "\\["][, lib_size := NULL]
+
+    # Bind all into a single data.table
+    dt <- rbindlist(list("up" = up_by_l, "down" = down_by_l), idcol="direction")
+
+    # Make percentage up/down separate columns with one row for each length category/id
+    dt <- melt(dt, id.vars=c("id", "direction"))
+    result <- dcast(dt, id + variable ~ direction, value.var = "value")
+
+    # Add the ratio of up:down for each length
+    result[, up_down_ratio := up / down]
+
+    return(result)
+}
+```
+
+Compute the percentages for each of the types of length computations. **These might not be super useful** but hold onto
+the calculation for now
+
+```{r}
+dt_tol <- countDeByLength(up_m, down_m, q_tol)
+dt_exl <- countDeByLength(up_m, down_m, q_exl)
+dt_mxl <- countDeByLength(up_m, down_m, q_mxl)
+```
+
+## How about probability of DE as a function of gene length?
+
+goseq will fit a probability weight function that computes the probability that a gene is DE based on its length alone
+
+```{r}
+# Function used to extract the PWF from the DE + gene lengths
+getPwfByLenth <- function(x, l) {
+    na_idx <- is.na(x)
+    x <- x[!na_idx]
+    l <- l[!na_idx]
+
+    result <- goseq::nullp(x, genome = "hg38", id = "geneSymbol", bias.data = l, plot.fit = FALSE)
+    result <- result[order(result$bias.data), ]
+    result$log10_l <- log10(result$bias.data)
+
+    return(result)
+}
+```
+
+Get the pwf for each contrast
+
+```{r}
+up_pwf_by_tol <- parallel::mclapply(1:ncol(up_m), function(i) {
+    getPwfByLenth(up_m[, i], l=rowData(se2)$total_gene_length)
+    }, mc.cores=32
+)
+
+down_pwf_by_tol <- parallel::mclapply(1:ncol(down_m), function(i) {
+    getPwfByLenth(down_m[, i], l=rowData(se2)$total_gene_length)
+    }, mc.cores=32
+)
+```
+
+Show a plot of all contrasts 
+
+```{r}
+png(here(figures, "pwf-by-tol.png"), width=12, height=6, units="in", res=300)
+
+par(mfrow=c(1, 2))
+
+tol_rng <- range(log10(rowData(se2)$total_gene_length)) 
+
+# Up-regulation
+plot.new()
+plot.window(xlim = tol_rng, ylim = c(0,1))
+axis(1, lwd = 0, font.axis=2)
+axis(2, lwd = 0, font.axis=2)
+title(xlab = "Gene Length (log10)")
+title(ylab = "Probability Differentially Expressed")
+title(main = "Up-regulation", adj = 0)
+for (i in 1:length(up_pwf_by_tol)) {
+    d <- up_pwf_by_tol[[i]]
+    lines(x = d$log10_l, y=d$pwf, col="#00000030")
+}
+
+# Down-regulation
+plot.new()
+plot.window(xlim = tol_rng, ylim = c(0,1))
+axis(1, lwd = 0, font.axis=2)
+axis(2, lwd = 0, font.axis=2)
+title(xlab = "Gene Length (log10)")
+title(ylab = "Probability Differentially Expressed")
+title(main = "Down-regulation", adj = 0)
+for (i in 1:length(down_pwf_by_tol)) {
+    d <- down_pwf_by_tol[[i]]
+    lines(x = d$log10_l, y=d$pwf, col="#00000030")
+}
+
+dev.off()
+```
+
+

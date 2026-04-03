@@ -1,0 +1,90 @@
+---
+title: Add gene lengths to rowData
+author: Gennaro Calendo
+format: html
+---
+
+The goal of this script will be to create rowData for the gene lengths for all of the 
+features included in the database. For TEs it's a little unclear how this should be 
+performed at the subfamily level. 
+
+## Set up 
+
+```{r}
+suppressPackageStartupMessages(library(here))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(GenomicFeatures))
+
+datafiles <- here("analysis", "results", "data-files", "01")
+figures <- here("analysis", "results", "figures", "01")
+rdsfiles <- here("analysis", "results", "rds-files", "01")
+
+invisible(sapply(c(datafiles, figures, rdsfiles), dir.create, showWarnings=F, recursive=T))
+```
+
+## Read in the genome annotation
+
+The REdiscoverTE pipeline uses GENCODE v26 annotations. Download the actual gtf file so that I can create txdbs to compute
+exon and transcript lengths 
+
+```{r}
+gtffile <- here(datafiles, "gencode.v26.annotation.gtf.gz")
+
+if (!file.exists(gtffile)) {
+    download.file(
+        "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_26/gencode.v26.annotation.gtf.gz", 
+        gtffile
+    )
+    gtf <- rtracklayer::import(gtffile)
+} else {
+    gtf <- rtracklayer::import(gtffile)
+}
+```
+
+### Total gene length
+
+The position of the start to the end **including introns**
+
+```{r}
+genes <- gtf[gtf$type == "gene"]
+total_gene_length <- width(genes)
+names(total_gene_length) <- genes$gene_id
+```
+
+### Sum of reduced exons 
+
+Take all of the unique exon ranges for each gene and sum the total widths
+
+```{r}
+txdb <- txdbmaker::makeTxDbFromGRanges(gtf)
+
+exons_by_gene <- exonsBy(txdb, by = "gene")
+reduced_exon_lengths <- sum(width(reduce(exons_by_gene)))
+names(reduced_exon_lengths) <- names(exons_by_gene)
+```
+
+### Median transcript length
+
+Takes the median length of all transcripts for a given gene
+
+```{r}
+tx_by_gene <- transcriptsBy(txdb, by = "gene")
+median_tx_lengths <- median(width(tx_by_gene))
+names(median_tx_lengths) <- names(tx_by_gene)
+```
+
+## Create a final table to annotate these genes
+
+```{r}
+df <- data.table(
+    gene_id = genes$gene_id,
+    gene_name = genes$gene_name,
+    gene_type = genes$gene_type,
+    total_gene_length = total_gene_length[genes$gene_id],
+    reduced_exon_lengths = reduced_exon_lengths[genes$gene_id],
+    median_tx_lengths = median_tx_lengths[genes$gene_id]
+)
+
+fwrite(df, here(datafiles, "v26-gene-length-annotation.tsv"), sep="\t")
+```

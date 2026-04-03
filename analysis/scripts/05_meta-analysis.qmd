@@ -1,0 +1,1200 @@
+---
+author: Gennaro Calendo
+title: Perform meta-analysis on collections of DE experiments
+format: html
+---
+
+## Set up
+
+```{r}
+suppressPackageStartupMessages(library(here))
+suppressPackageStartupMessages(library(coriell))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(SummarizedExperiment))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(patchwork))
+suppressPackageStartupMessages(library(legendry))
+suppressPackageStartupMessages(library(ComplexHeatmap))
+suppressPackageStartupMessages(library(gt))
+suppressPackageStartupMessages(library(PCAtools))
+suppressPackageStartupMessages(library(variancePartition))
+
+datafiles <- here("analysis", "results", "data-files", "05")
+figures <- here("analysis", "results", "figures", "05")
+rdsfiles <- here("analysis", "results", "rds-files", "05")
+
+invisible(sapply(c(datafiles, figures, rdsfiles), dir.create, showWarnings = F))
+```
+
+## Connect to TEDEdb
+
+```{r}
+db <- HDF5Array::loadHDF5SummarizedExperiment(
+  "/mnt/data/data_gc/TEDEdb/appdata/se_hdf5"
+)
+```
+
+## Filter contrasts
+
+- Remove any contrasts from primary cells or multiple cell lines combined
+- Remove any contrasts from non-cancer cell lines
+- Remove any contrasts containing samples flagged as outliers
+
+```{r}
+db <- db[, !db$cell_line %like% "^PRIMARY|^MULTIPLE"]
+db <- db[,
+  db$oncotree_primary_disease != "Non-Cancerous" &
+    !is.na(db$oncotree_primary_disease)
+]
+db <- db[, db$outlier_flags == "None"]
+```
+
+## Perform meta-analysis on top contrasts
+
+Pick treatments with the greatest number of contrasts in the database
+
+```{r}
+# Take the top treatments by number of contrasts
+# head(sort(table(db$treatment), decreasing=T), n=10)
+
+trts <- c(
+  "OTS964",
+  "Doxorubicin",
+  "Decitabine",
+  "Actinomycin D",
+  "Etoposide",
+  "Azacitidine",
+  "JQ1",
+  "Gemcitabine",
+  "THZ1"
+)
+
+# How many BioProjects, cell lines, etc. are represented?
+for (trt in trts) {
+  df <- colData(db)[db$treatment == trt, ]
+  msg <- paste0(
+    trt,
+    " - ",
+    "Contrasts: ",
+    nrow(df),
+    "; ",
+    "BioProjects: ",
+    length(unique(df$experiment)),
+    "; ",
+    "Cell Lines: ",
+    length(unique(df$cell_line)),
+    "; ",
+    "Lineages: ",
+    length(unique(df$oncotree_lineage)),
+    "\n"
+  )
+  cat(msg)
+}
+```
+
+For the main:
+
+> Decitabine - Contrasts: 35; BioProjects: 13; Cell Lines: 21; Lineages: 7
+> Doxorubicin - Contrasts: 38; BioProjects: 10; Cell Lines: 16; Lineages: 7
+> Etoposide - Contrasts: 30; BioProjects: 7; Cell Lines: 25; Lineages: 8
+> JQ1 - Contrasts: 20; BioProjects: 7; Cell Lines: 15; Lineages: 5
+
+For the supplement(?):
+
+> Azacitidine - Contrasts: 22; BioProjects: 4; Cell Lines: 10; Lineages: 3
+> Gemcitabine - Contrasts: 18; BioProjects: 4; Cell Lines: 5; Lineages: 3
+> Actinomycin D - Contrasts: 32; BioProjects: 3; Cell Lines: 3; Lineages: 2
+> THZ1 - Contrasts: 16; BioProjects: 4; Cell Lines: 7; Lineages: 3
+
+Exclude since only one BioProject:
+
+> OTS964 - Contrasts: 40; BioProjects: 1; Cell Lines: 5; Lineages: 4
+
+Perform the meta-analysis on these treatments
+
+```{r}
+meta_results <- parallel::mclapply(
+  trts,
+  function(x) {
+    se <- db[, db$treatment == x]
+    result <- meta_de(
+      se,
+      FUN = metapod::parallelFisher,
+      pval = "P.Value",
+      se = "SE"
+    )
+    result <- result[!is.na(Meta.Pval)]
+    result[, Meta.FDR := p.adjust(Meta.Pval, method = "BH")]
+    return(result)
+  },
+  mc.cores = 4
+)
+names(meta_results) <- trts
+
+# Save results to file
+meta_results_dt <- rbindlist(meta_results, idcol = "treatment")
+fwrite(
+  meta_results_dt,
+  here(datafiles, "meta-analysis-results.tsv"),
+  sep = "\t"
+)
+```
+
+### Perform jackknife resampling on the meta-results to assess robustness
+
+```{r}
+run <- FALSE
+
+if (run) {
+  metafun <- function(x) {
+    meta_de(x, metapod::parallelFisher, pval = "P.Value", se = "SE")
+  }
+
+  message("Running Decitabine jacknife meta-analysis...")
+  dac_jk_results <- jackknifeSE(db[, db$treatment == "Decitabine"], FUN = metafun)
+  dac_jk_results <- rbindlist(dac_jk_results, idcol = "Jackknife")
+  dac_jk_results <- dac_jk_results[!is.na(Meta.Pval)]
+  dac_jk_results[, Meta.FDR := p.adjust(Meta.Pval, method = "BH"), by = Jackknife]
+  fwrite(dac_jk_results, here(datafiles, "dac-jackknife-results.tsv"), sep = "\t")
+
+  message("Running Doxorubicin jacknife meta-analysis...")
+  dox_jk_results <- jackknifeSE(db[, db$treatment == "Doxorubicin"], FUN = metafun)
+  dox_jk_results <- rbindlist(dox_jk_results, idcol = "Jackknife")
+  dox_jk_results <- dox_jk_results[!is.na(Meta.Pval)]
+  dox_jk_results[, Meta.FDR := p.adjust(Meta.Pval, method = "BH"), by = Jackknife]
+  fwrite(dox_jk_results, here(datafiles, "dox-jackknife-results.tsv"), sep = "\t")
+
+  message("Running Etoposide jacknife meta-analysis...")
+  eto_jk_results <- jackknifeSE(db[, db$treatment == "Etoposide"], FUN = metafun)
+  eto_jk_results <- rbindlist(eto_jk_results, idcol = "Jackknife")
+  eto_jk_results <- eto_jk_results[!is.na(Meta.Pval)]
+  eto_jk_results[, Meta.FDR := p.adjust(Meta.Pval, method = "BH"), by = Jackknife]
+  fwrite(eto_jk_results, here(datafiles, "eto-jackknife-results.tsv"), sep = "\t")
+
+  message("Running JQ1 jacknife meta-analysis...")
+  jq1_jk_results <- jackknifeSE(db[, db$treatment == "JQ1"], FUN = metafun)
+  jq1_jk_results <- rbindlist(jq1_jk_results, idcol = "Jackknife")
+  jq1_jk_results <- jq1_jk_results[!is.na(Meta.Pval)]
+  jq1_jk_results[, Meta.FDR := p.adjust(Meta.Pval, method = "BH"), by = Jackknife]
+  fwrite(jq1_jk_results, here(datafiles, "jq1-jackknife-results.tsv"), sep = "\t")
+} else {
+  dac_jk_results <- fread(here(datafiles, "dac-jackknife-results.tsv"))
+  dox_jk_results <- fread(here(datafiles, "dox-jackknife-results.tsv"))
+  eto_jk_results <- fread(here(datafiles, "eto-jackknife-results.tsv"))
+  jq1_jk_results <- fread(here(datafiles, "jq1-jackknife-results.tsv"))
+}
+```
+
+Compute the jackknife bias and standard error on the percentage differential expression
+
+```{r}
+computeJackknifeBias <- function(orig, jacks, n, feature = "genes") {
+  if (feature == "genes") {
+    dt1 <- orig[!Feature %like% ".*\\..*\\..*"]
+    dt2 <- jacks[!Feature %like% ".*\\..*\\..*"]
+  } else {
+    dt1 <- orig[Feature %like% ".*\\..*\\..*"]
+    dt2 <- jacks[Feature %like% ".*\\..*\\..*"]
+  }
+
+  # Get the observed data from the full test
+  summary_stats <- summarize_dge(
+    dt1,
+    fdr = 0.1,
+    lfc = log2(1.5),
+    fdr_col = "Meta.FDR",
+    lfc_col = "Meta.logFC"
+  )
+  setDT(summary_stats)
+  theta_hat_up <- summary_stats[Direction == "Up", Percent]
+  theta_hat_down <- summary_stats[Direction == "Down", Percent]
+
+  # Compute mean percentages across all jackknifes
+  jack_stats <- dt2[,
+    summarize_dge(.SD, fdr = 0.1, lfc = log2(1.5), fdr_col = "Meta.FDR", lfc_col = "Meta.logFC"),
+    by = Jackknife
+  ]
+
+  jack_estimates_up <- jack_stats[Direction == "Up", Percent]
+  jack_estimates_down <- jack_stats[Direction == "Down", Percent]
+  theta_bar_up <- mean(jack_estimates_up)
+  theta_bar_down <- mean(jack_estimates_down)
+
+  # Compute jackknife bias and variance
+  bias_jack_up <- (n - 1) * (theta_bar_up - theta_hat_up)
+  bias_jack_down <- (n - 1) * (theta_bar_down - theta_hat_down)
+
+  var_term_up <- sum((jack_estimates_up - theta_bar_up)^2)
+  var_term_down <- sum((jack_estimates_down - theta_bar_down)^2)
+
+  se_jack_up <- sqrt(((n - 1) / n) * var_term_up)
+  se_jack_down <- sqrt(((n - 1) / n) * var_term_down)
+
+  data.table(
+    Direction = c("Up", "Down"),
+    Observed = c(theta_hat_up, theta_hat_down),
+    Corrected = c(theta_hat_up - bias_jack_up, theta_hat_down - bias_jack_down),
+    Bias = c(bias_jack_up, bias_jack_down),
+    SE = c(se_jack_up, se_jack_down)
+  )
+}
+```
+
+Compute the bias and variance for each set of results
+
+```{r}
+jacks <- list(
+  Decitabine = dac_jk_results,
+  Doxorubicin = dox_jk_results,
+  Etoposide = eto_jk_results,
+  JQ1 = jq1_jk_results
+)
+
+ns <- list(
+  Decitabine = ncol(db[, db$treatment == "Decitabine"]),
+  Doxorubicin = ncol(db[, db$treatment == "Doxorubicin"]),
+  Etoposide = ncol(db[, db$treatment == "Etoposide"]),
+  JQ1 = ncol(db[, db$treatment == "JQ1"])
+)
+
+origs <- meta_results[names(jacks)]
+
+# Compute jackknife bias and variance for gene percentages
+gene_jack_stats <- Map(
+  computeJackknifeBias,
+  orig = origs,
+  jacks = jacks,
+  n = ns
+)
+names(gene_jack_stats) <- paste0(names(gene_jack_stats), " (n=", unlist(ns), ")")
+gene_jack_stats <- rbindlist(gene_jack_stats, idcol = "Compound")
+
+# Compute jackknife bias and variance for TE percentages
+te_jack_stats <- Map(
+  computeJackknifeBias,
+  orig = origs,
+  jacks = jacks,
+  n = ns,
+  feature = "TE"
+)
+names(te_jack_stats) <- paste0(names(te_jack_stats), " (n=", unlist(ns), ")")
+te_jack_stats <- rbindlist(te_jack_stats, idcol = "Compound")
+```
+
+### Permute the features in each matrix to get baseline for percentages that are expected
+
+JP wanted to know some kind of 'baseline' expectation for how many genes are expected to be 
+dysregulated in a given meta-analysis. He suggested permuting the genes and re-computing the 
+meta-analysis. My expectation is that this will yield hardly any DE results and will not serve as a 
+more useful assesment of stability than the jackknife.
+
+First, create a funtion that will shuffle the entries in each column of the given se object, keeping 
+each column self-contained (so all results from a single experiment are shuffled) but synchronized 
+across P.value, SE, and logFC matrices. This requires first generating ncol indeces from 1:nrow and 
+then applying these shuffled indeces to each matrix of the SE to ensure they stay in sync.  
+
+```{r}
+shuffleSE <- function(x) {
+  # Realize original matrices in-memory
+  orig_lfc <- as.matrix(assay(x, "logFC"))
+  orig_pval <- as.matrix(assay(x, "P.Value"))
+  orig_stderr <- as.matrix(assay(x, "SE"))
+
+  # Allocate new space for shuffled results
+  lfc <- matrix(data = NA_real_, ncol = ncol(x), nrow = nrow(x))
+  pval <- matrix(data = NA_real_, ncol = ncol(x), nrow = nrow(x))
+  stderr <- matrix(data = NA_real_, ncol = ncol(x), nrow = nrow(x))
+  dimnames(lfc) <- dimnames(pval) <- dimnames(stderr) <- dimnames(orig_lfc)
+
+  # Create random row indeces per column and populate matrices
+  rand_row_per_col <- replicate(ncol(x), sample.int(nrow(x)), simplify = FALSE)
+  for (j in seq_along(rand_row_per_col)) {
+    i <- rand_row_per_col[[j]]
+    lfc[, j] <- orig_lfc[i, j]
+    pval[, j] <- orig_pval[i, j]
+    stderr[, j] <- orig_stderr[i, j]
+  }
+
+  result <- SummarizedExperiment::SummarizedExperiment(
+    assays = list("P.Value" = pval, "logFC" = lfc, "SE" = stderr)
+  )
+
+  return(result)
+}
+```
+
+Wrapper for computing meta-results and summarizing
+
+```{r}
+# Perform and summarize the meta-results
+summarizeMetaResults <- function(x) {
+  meta_result <- meta_de(x, FUN = metapod::parallelFisher, pval = "P.Value", se = "SE")
+  meta_result <- meta_result[!is.na(Meta.Pval)]
+  meta_result[, Meta.FDR := p.adjust(Meta.Pval, method = "BH")]
+
+  genes <- summarize_dge(
+    meta_result[!Feature %like% ".*\\..*\\..*"],
+    fdr = 0.1,
+    lfc = log2(1.5),
+    fdr_col = "Meta.FDR",
+    lfc_col = "Meta.logFC"
+  )
+
+  tes <- summarize_dge(
+    meta_result[Feature %like% ".*\\..*\\..*"],
+    fdr = 0.1,
+    lfc = log2(1.5),
+    fdr_col = "Meta.FDR",
+    lfc_col = "Meta.logFC"
+  )
+
+  both <- summarize_dge(
+    meta_result,
+    fdr = 0.1,
+    lfc = log2(1.5),
+    fdr_col = "Meta.FDR",
+    lfc_col = "Meta.logFC"
+  )
+
+  result <- rbindlist(list("Genes" = genes, "TEs" = tes, "Both" = both), idcol = "Feature")
+
+  return(result)
+}
+```
+
+Perform the permutation meta-analysis
+
+```{r}
+run <- FALSE
+if (run) {
+  B <- 500
+  trts2 <- c("Decitabine", "Doxorubicin", "Etoposide", "JQ1")
+
+  meta_perms <- lapply(trts2, function(x) {
+    se <- db[, db$treatment == x]
+    results <- rbindlist(
+      parallel::mclapply(
+        1:B,
+        function(i) {
+          shuffled <- shuffleSE(se)
+          summarizeMetaResults(shuffled)
+        },
+        mc.cores = 48
+      ),
+      idcol = "B"
+    )
+  })
+  names(meta_perms) <- trts2
+  meta_perms <- rbindlist(meta_perms, idcol = "treatment")
+  fwrite(meta_perms, here(datafiles, "meta-perm-summary.tsv"), sep = "\t")
+} else {
+  meta_perms <- fread(here(datafiles, "meta-perm-summary.tsv"))
+}
+```
+
+Display the histogram of results for each
+
+```{r}
+# Plot for genes
+ggplot(meta_perms[Feature == "Genes" & Direction != "Unperturbed"], aes(x = Percent)) +
+  geom_histogram(fill = "cornflowerblue", alpha = 0.9) +
+  facet_grid(Direction ~ treatment) +
+  scale_x_continuous(labels = scales::percent_format(scale = 1)) +
+  labs(
+    title = "Protein Coding Genes",
+    x = "Observed Percentage Differentially Expressed",
+    y = "Number of Permutations",
+    caption = "500 total permutations"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 12, color = "black"),
+    axis.text = element_text(color = "black", size = 12),
+    axis.title = element_text(size = 14, color = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(size = 18, face = "bold"),
+    plot.subtitle = element_text(size = 14)
+  )
+ggsave(here(figures, "gene-meta-perm.png"), width = 12, height = 6, dpi = 600)
+
+# And for TEs
+ggplot(meta_perms[Feature == "TEs" & Direction != "Unperturbed"], aes(x = Percent)) +
+  geom_histogram(fill = "cornflowerblue", alpha = 0.9) +
+  facet_grid(Direction ~ treatment) +
+  scale_x_continuous(labels = scales::percent_format(scale = 1)) +
+  labs(
+    title = "TE Subfamilies",
+    x = "Observed Percentage Differentially Expressed",
+    y = "Number of Permutations",
+    caption = "500 total permutations"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 12, color = "black"),
+    axis.text = element_text(color = "black", size = 12),
+    axis.title = element_text(size = 14, color = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(size = 18, face = "bold"),
+    plot.subtitle = element_text(size = 14)
+  )
+ggsave(here(figures, "te-meta-perm.png"), width = 12, height = 6, dpi = 600)
+```
+
+JP wants to include these results in the table included in the manuscript as 'background' levels 
+of false positives. For this it might be best to compute CIs to include in the table
+
+```{r}
+perm_summary <- meta_perms[,
+  .(
+    avg = mean(Percent),
+    ci_low = quantile(Percent, prob = 0.025),
+    ci_high = quantile(Percent, prob = 0.975)
+  ),
+  by = .(treatment, Feature, Direction)
+]
+
+perm_summary[,
+  background := paste0(round(avg, 1), "% [", round(ci_low, 1), " - ", round(ci_high, 1), "]%")
+]
+
+perm_summary <- perm_summary[, .(treatment, Feature, Direction, background)]
+gene_perm_summary <- perm_summary[Feature == "Genes"][, Feature := NULL]
+te_perm_summary <- perm_summary[Feature == "TEs"][, Feature := NULL]
+```
+
+Join onto the jackknife results table
+
+```{r}
+gene_jack_stats[, treatment := gsub(" \\(.*", "", Compound)]
+te_jack_stats[, treatment := gsub(" \\(.*", "", Compound)]
+
+gene_jack_stats <- merge(
+  x = gene_jack_stats,
+  y = gene_perm_summary,
+  by = c("treatment", "Direction"),
+  all.x = TRUE
+)
+gene_jack_stats[, treatment := NULL]
+setnames(gene_jack_stats, old = "background", new = "Background [95% CI]")
+
+te_jack_stats <- merge(
+  x = te_jack_stats,
+  y = te_perm_summary,
+  by = c("treatment", "Direction"),
+  all.x = TRUE
+)
+te_jack_stats[, treatment := NULL]
+setnames(te_jack_stats, old = "background", new = "Background [95% CI]")
+```
+
+### Create the table showing jackknife and background estimates
+
+```{r}
+gt(gene_jack_stats, groupname_col = "Compound", row_group_as_column = TRUE) |>
+  tab_header(
+    title = md("Jackknife Bias Estimates for Gene Meta-Analysis")
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  cols_align(
+    align = "left",
+    columns = c(Compound)
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(Direction)
+  ) |>
+  cols_align(
+    align = "right",
+    columns = c(`Background [95% CI]`)
+  ) |>
+  fmt_percent(
+    columns = c(Observed, Corrected, Bias, SE),
+    decimals = 1,
+    scale_values = FALSE
+  ) |>
+  opt_stylize(style = 1, color = "gray", add_row_striping = FALSE)
+```
+
+Same for TEs
+
+```{r}
+gt(te_jack_stats, groupname_col = "Compound", row_group_as_column = TRUE) |>
+  tab_header(
+    title = md("Jackknife Bias Estimates for TE Meta-Analysis")
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  cols_align(
+    align = "left",
+    columns = c(Compound)
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(Direction)
+  ) |>
+  cols_align(
+    align = "right",
+    columns = c(`Background [95% CI]`)
+  ) |>
+  fmt_percent(
+    columns = c(Observed, Corrected, Bias, SE),
+    decimals = 1,
+    scale_values = FALSE
+  ) |>
+  opt_stylize(style = 1, color = "gray", add_row_striping = FALSE)
+```
+
+### Show the meta-volcano plots
+
+```{r}
+plot_gene_volcano <- function(x, ...) {
+  coriell::plot_volcano(
+    meta_results[[x]][!Feature %like% ".*\\..*\\..*"],
+    x = "Meta.logFC",
+    y = "Meta.FDR",
+    fdr = 0.1,
+    lfc = log2(1.5),
+    raster = TRUE,
+    raster_dpi = 600,
+    x_axis_limits = c(-5, 5),
+    y_axis_limits = c(0, 300),
+    lab_digits = 0,
+    ...
+  ) +
+    labs(
+      title = x,
+      subtitle = "Protein Coding Genes",
+      x = "Meta logFC",
+      y = "-log10(Meta FDR)",
+      caption = NULL
+    )
+}
+
+plot_te_volcano <- function(x, ...) {
+  coriell::plot_volcano(
+    meta_results[[x]][Feature %like% ".*\\..*\\..*"],
+    x = "Meta.logFC",
+    y = "Meta.FDR",
+    fdr = 0.1,
+    lfc = log2(1.5),
+    raster = TRUE,
+    raster_dpi = 600,
+    x_axis_limits = c(-2, 2),
+    y_axis_limits = c(0, 40),
+    lab_digits = 0,
+    up_color = "red2",
+    up_shape = 1,
+    ...
+  ) +
+    geom_point(
+      data = meta_results[[x]][
+        Feature %like% "^LTR.ERV" & Meta.logFC > log2(1.5) & Meta.FDR < 0.1
+      ],
+      aes(x = Meta.logFC, y = -log10(Meta.FDR)),
+      color = "red2",
+      shape = 16
+    ) +
+    labs(
+      title = x,
+      subtitle = "TE Subfamilies",
+      x = "Meta logFC",
+      y = "-log10(Meta FDR)",
+      caption = NULL
+    )
+}
+```
+
+#### Patch all together
+
+```{r}
+p1 <- plot_gene_volcano("Decitabine")
+p2 <- plot_te_volcano("Decitabine")
+p3 <- plot_gene_volcano("Doxorubicin")
+p4 <- plot_te_volcano("Doxorubicin")
+p5 <- plot_gene_volcano("Etoposide")
+p6 <- plot_te_volcano("Etoposide")
+p7 <- plot_gene_volcano("JQ1")
+p8 <- plot_te_volcano("JQ1")
+
+# Genes
+p1 + p3 + p5 + p7 + plot_layout(ncol = 2)
+ggsave(here(figures, "meta-gene-volcano.png"), width = 11, height = 9, dpi = 600)
+ggsave(here(figures, "meta-gene-volcano.pdf"), width = 11, height = 9)
+
+# TEs
+p2 + p4 + p6 + p8 + plot_layout(ncol = 2)
+ggsave(here(figures, "meta-te-volcano.png"), width = 11, height = 9, dpi = 600)
+ggsave(here(figures, "meta-te-volcano.pdf"), width = 11, height = 9)
+```
+
+### Count the ERVs that are up-regulated in each meta-analysis
+
+```{r}
+(erv_counts <- meta_results_dt[
+  Meta.FDR < 0.05 &
+    Meta.logFC > log2(1.5) &
+    Feature %like% "^LTR.ERV" &
+    treatment %chin% c("Decitabine", "Etoposide", "Doxorubicin", "JQ1"),
+  .N,
+  by = treatment
+][order(N, decreasing = T)])
+```
+
+### What genes and TEs are shared between the sets?
+
+```{r}
+keep_trt <- c("Decitabine", "Doxorubicin", "Etoposide", "JQ1")
+
+up_meta <- meta_results_dt[
+  Meta.FDR < 0.05 & Meta.logFC > log2(1.5) & treatment %chin% keep_trt
+]
+down_meta <- meta_results_dt[
+  Meta.FDR < 0.05 & Meta.logFC < -log2(1.5) & treatment %chin% keep_trt
+]
+
+up_meta <- split(up_meta, by = "treatment")
+down_meta <- split(down_meta, by = "treatment")
+
+# Reorder
+up_meta <- up_meta[keep_trt]
+down_meta <- down_meta[keep_trt]
+
+up_genes <- lapply(up_meta, \(x) x[!Feature %like% ".*\\..*\\..*", Feature])
+down_genes <- lapply(down_meta, \(x) x[Feature %like% ".*\\..*\\..*", Feature])
+up_tes <- lapply(up_meta, \(x) x[Feature %like% ".*\\..*\\..*", Feature])
+down_tes <- lapply(down_meta, \(x) x[Feature %like% ".*\\..*\\..*", Feature])
+
+names(up_genes) <- names(up_tes) <- paste(names(up_genes), "(Up)")
+names(down_genes) <- names(down_tes) <- paste(names(down_genes), "(Down)")
+
+sig_genes <- c(up_genes, down_genes)
+sig_tes <- c(up_tes, down_tes)
+```
+
+Create UpSet plots of the shared features in the sets of interest
+
+```{r}
+m_genes <- make_comb_mat(sig_genes, mode = "distinct")
+m_tes <- make_comb_mat(sig_tes, mode = "distinct")
+
+# limit to pairwise overlaps
+m_genes <- m_genes[comb_degree(m_genes) == 2]
+m_tes <- m_tes[comb_degree(m_tes) == 2]
+```
+
+```{r}
+# png(
+#   here(figures, "meta-upset_genes.png"),
+#   width = 9,
+#   height = 6,
+#   units = "in",
+#   res = 600
+# )
+pdf(here(figures, "meta-upset_genes.pdf"), width = 9, height = 6)
+u1 <- UpSet(
+  m_genes,
+  comb_order = order(comb_size(m_genes), decreasing = TRUE),
+  set_order = names(sig_genes),
+  bg_col = rep(c("#F0F0FF", "#FFF0F0"), each = 4),
+  top_annotation = upset_top_annotation(
+    m_genes,
+    add_numbers = TRUE,
+    numbers_gp = gpar(cex = 1)
+  ),
+  right_annotation = upset_right_annotation(
+    m_genes,
+    add_numbers = TRUE,
+    numbers_gp = gpar(cex = 1)
+  ),
+  column_title = "Protein Coding Genes"
+)
+draw(u1, padding = unit(c(1, 1, 1, 1), "cm"))
+dev.off()
+```
+
+```{r}
+# png(
+#   here(figures, "meta-upset_tes.png"),
+#   width = 9,
+#   height = 6,
+#   units = "in",
+#   res = 600
+# )
+pdf(here(figures, "meta-upset_tes.pdf"), width = 9, height = 6)
+u2 <- UpSet(
+  m_tes,
+  comb_order = order(comb_size(m_tes), decreasing = TRUE),
+  set_order = names(sig_tes),
+  bg_col = rep(c("#F0F0FF", "#FFF0F0"), each = 4),
+  top_annotation = upset_top_annotation(
+    m_tes,
+    add_numbers = TRUE,
+    numbers_gp = gpar(cex = 1)
+  ),
+  right_annotation = upset_right_annotation(
+    m_tes,
+    add_numbers = TRUE,
+    numbers_gp = gpar(cex = 1)
+  ),
+  column_title = "TE Subfamilies"
+)
+draw(u2, padding = unit(c(1, 1, 1, 1), "cm"))
+dev.off()
+```
+
+## Perform GSEA on the meta results
+
+### Read in HALLMARK pathways
+
+```{r}
+hallmark <- msigdbr::msigdbr(
+  db_species = "HS",
+  species = "human",
+  collection = "H"
+)
+hallmark <- split(as.character(hallmark$gene_symbol), hallmark$gs_name)
+
+# Get only the interferon signatures
+ifn <- hallmark[c(
+  "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+  "HALLMARK_INTERFERON_GAMMA_RESPONSE"
+)]
+```
+
+### Run CAMERA-PR on the meta stats
+
+```{r}
+run_camera <- function(x) {
+  stats <- x[, Meta.z]
+  names(stats) <- x[, Feature]
+
+  idx <- limma::ids2indices(ifn, names(stats))
+  result <- setDT(
+    limma::cameraPR(stats, idx, use.ranks = TRUE),
+    keep.rownames = "pathway"
+  )
+
+  return(list(result = result, stats = stats, idx = idx))
+}
+
+camera_results <- lapply(meta_results, run_camera)
+```
+
+Write out results
+
+```{r}
+camera_results_dt <- rbindlist(
+  lapply(camera_results, `[[`, "result"),
+  idcol = "treatment"
+)
+fwrite(
+  camera_results_dt,
+  here(datafiles, "meta-camerapr-results.tsv"),
+  sep = "\t"
+)
+```
+
+### Run fGSEA on meta z-statistics
+
+```{r}
+run_fgsea <- function(x) {
+  stats <- x[, Meta.z]
+  names(stats) <- x[, Feature]
+
+  result <- fgsea::fgsea(
+    pathways = ifn,
+    stats = stats,
+    nPermSimple = 1e4,
+    eps = 0.0,
+    scoreType = "pos"
+  )
+
+  return(list(result = result, stats = stats))
+}
+
+fgsea_results <- lapply(meta_results, run_fgsea)
+```
+
+Write out results
+
+```{r}
+fgsea_results_dt <- rbindlist(
+  lapply(fgsea_results, `[[`, "result"),
+  idcol = "treatment"
+)
+fwrite(fgsea_results_dt, here(datafiles, "meta-fgsea-results.tsv"), sep = "\t")
+```
+
+### Plot enrichment results
+
+```{r}
+plot_ifna <- function(x, ...) {
+  coriell::plot_enrichment(
+    pathway = ifn[["HALLMARK_INTERFERON_ALPHA_RESPONSE"]],
+    stats = fgsea_results[[x]]$stats,
+    FDR = camera_results[[x]]$result[
+      pathway == "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+      FDR
+    ],
+    ES = fgsea_results[[x]]$result[
+      pathway == "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+      ES
+    ],
+    NES = fgsea_results[[x]]$result[
+      pathway == "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+      NES
+    ],
+    annotate = TRUE,
+    anno_size = 6,
+    ...
+  ) +
+    labs(title = x, subtitle = "Hallmark Interferon Alpha Response")
+}
+
+plot_ifny <- function(x, ...) {
+  coriell::plot_enrichment(
+    pathway = ifn[["HALLMARK_INTERFERON_GAMMA_RESPONSE"]],
+    stats = fgsea_results[[x]]$stats,
+    FDR = camera_results[[x]]$result[
+      pathway == "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+      FDR
+    ],
+    ES = fgsea_results[[x]]$result[
+      pathway == "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+      ES
+    ],
+    NES = fgsea_results[[x]]$result[
+      pathway == "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+      NES
+    ],
+    annotate = TRUE,
+    anno_size = 6,
+    ...
+  ) +
+    labs(title = x, subtitle = "Hallmark Interferon Gamma Response")
+}
+```
+
+#### Patch all together
+
+```{r}
+p1 <- plot_ifna("Decitabine")
+p2 <- plot_ifny("Decitabine")
+p3 <- plot_ifna("Doxorubicin")
+p4 <- plot_ifny("Doxorubicin")
+p5 <- plot_ifna("Etoposide")
+p6 <- plot_ifny("Etoposide")
+p7 <- plot_ifna("JQ1", lineColor = "grey", anno_y_pos = 0.55)
+p8 <- plot_ifny("JQ1", lineColor = "grey", anno_y_pos = 0.65)
+
+p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8 + plot_layout(ncol = 4)
+ggsave(here(figures, "meta-gsea.png"), width = 22, height = 9, dpi = 600)
+ggsave(here(figures, "meta-gsea.pdf"), width = 22, height = 9)
+```
+
+## Effect size analysis
+
+What is the average corelation of effect sizes within vs between treatments?
+
+```{r}
+results <- list()
+
+for (trt in c("Doxorubicin", "Decitabine", "Etoposide", "JQ1")) {
+  # Select treatments from below
+  selected <- db[, db$treatment == trt]
+
+  # Extract effect size matrices
+  gene_m <- as.matrix(assay(selected[rowData(selected)$feature_type == "Gene", ], "z"))
+  te_m <- as.matrix(assay(selected[rowData(selected)$feature_type == "TE", ], "z"))
+
+  # Get NA's from SE matrix
+  gene_na <- na.omit(as.matrix(assay(selected[rowData(selected)$feature_type == "Gene", ], "SE")))
+  te_na <- na.omit(as.matrix(assay(selected[rowData(selected)$feature_type == "TE", ], "SE")))
+
+  # Use only complete cases so we're not just looking at *what* was expressed
+  gene_m <- gene_m[rownames(gene_na), colnames(gene_na)]
+  te_m <- te_m[rownames(te_na), colnames(te_na)]
+
+  # Perform cross-study correlations
+  gene_corr <- cor(gene_m)
+  te_corr <- cor(te_m)
+
+  results[[trt]] <- list(gene = rowMeans(gene_corr), te = rowMeans(te_corr))
+}
+```
+
+## Correlate TE activation with interferon signals
+
+JP wanted to know if I could correlate TE activate with interferon response across the entire 
+database. This shouldn't be too bad. For each contrast, compute the percentage of TEs that are 
+up-regulated ERVs. Then compute the NES for the HALLMARK IFN A/G signatures. Plot enrichment score
+as a function of percentage up-regulation.
+
+### Compute the percentage up-regulation of TEs for all contrasts
+
+- Should I do this for all TEs? or just ERVs? All makes sense first
+
+```{r}
+is_te <- rowData(db)$feature_type == "TE"
+is_up_te <- (assay(db[is_te, ], "logFC") > 0) & (assay(db[is_te, ], "adj.P.Val") < 0.1)
+
+# Preserve NAs so percentages are correct
+is_na_te <- assay(db[is_te, ], "SE")
+is_na_te[!is.na(is_na_te)] <- 1.0
+is_up_te <- is_up_te * is_na_te
+
+prop_up_te <- data.table(
+  Contrast = colnames(is_up_te),
+  Prop_up = colMeans(is_up_te, na.rm = TRUE)
+)
+```
+
+### Compute the enrichment scores for IFN alpha/gamma
+
+Use the z-score as the ranking stat
+
+```{r}
+pathways <- hallmark[c(
+  "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+  "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+  "HALLMARK_INFLAMMATORY_RESPONSE"
+)]
+
+# Extract z-scores and propagate NAs
+gene_z_m <- as.matrix(assay(db[!is_te, ], "z"))
+gene_z_m[is.na(as.matrix(assay(db[!is_te, ], "SE")))] <- NA
+gene_names <- rownames(gene_z_m)
+
+run <- TRUE
+if (run) {
+  ifn_results <- apply(
+    X = gene_z_m,
+    MARGIN = 2,
+    FUN = function(x) {
+      stats <- x
+      names(stats) <- gene_names
+      stats <- stats[!is.na(stats)]
+      idx <- limma::ids2indices(pathways, names(stats))
+      setDT(limma::cameraPR(stats, idx, use.ranks = TRUE), keep.rownames = "pathway")
+    },
+    simplify = FALSE
+  )
+  saveRDS(ifn_results, here(rdsfiles, "ifn-results.rds"))
+} else {
+  ifn_results <- readRDS(here(rdsfiles, "ifn-results.rds"))
+}
+
+ifn_results <- rbindlist(ifn_results, idcol = "Contrast")
+```
+
+### Dichotomize results
+
+JP suggested categorizing TE enrichment by data-driven bins. Then count the enriched signatures 
+within each bin.
+
+```{r}
+# Left join
+ifn_props <- merge(
+  x = ifn_results,
+  y = prop_up_te,
+  by = "Contrast",
+  all.x = TRUE
+)
+
+# Create category labels for TE up-regulation
+ifn_props[, te_cut := Hmisc::cut2(Prop_up, g = 3)]
+
+# Create category labels for IFN enrichment
+ifn_props[, is_enriched := fifelse(Direction == "Up" & FDR < 0.1, "Enriched", "Not Enriched")]
+ifn_props[, is_enriched := factor(is_enriched, levels = c("Not Enriched", "Enriched"))]
+
+# Now count the numbers in each category, excluding those that could not be estimated by fgsea
+enrich_counts <- ifn_props[
+  !is.na(is_enriched),
+  .(count = .N),
+  by = .(pathway, te_cut, is_enriched)
+]
+
+# Compute proportions
+enrich_counts[, Prop := count / sum(count), by = .(pathway)]
+
+# Reorder pathways for plotting
+enrich_counts[,
+  pathway := factor(
+    pathway,
+    levels = c(
+      "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+      "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+      "HALLMARK_INFLAMMATORY_RESPONSE"
+    )
+  )
+]
+
+enrich_counts <- enrich_counts[order(pathway, te_cut, is_enriched)]
+
+# Add labels for TE cuts
+enrich_counts[,
+  te_label := fcase(
+    te_cut == "[0.00000,0.00274)" , "[0-0.2%)"   ,
+    te_cut == "[0.00274,0.01354)" , "[0.2-1.3%)" ,
+    te_cut == "[0.01354,0.96128]" , "[1.3-96%]"  ,
+    default = NA
+  )
+][, te_label := factor(te_label, levels = c("[0-0.2%)", "[0.2-1.3%)", "[1.3-96%]"))]
+
+# Add label for n values
+enrich_counts[, n_label := paste0("n=", count)]
+```
+
+### Test associations
+
+```{r}
+# ifn alpha
+ifn_alpha_tbl <- dcast(
+  enrich_counts[pathway == "HALLMARK_INTERFERON_ALPHA_RESPONSE"],
+  is_enriched ~ te_label,
+  value.var = "count",
+  fill = 0L
+)
+ifn_alpha_tbl <- as.matrix(ifn_alpha_tbl, rownames = "is_enriched")
+
+# Chisq test for trend in proportions
+ifn_alpha_test <- prop.trend.test(x = ifn_alpha_tbl[2, ], n = colSums(ifn_alpha_tbl))
+
+# ifn gamma
+ifn_gamma_tbl <- dcast(
+  enrich_counts[pathway == "HALLMARK_INTERFERON_GAMMA_RESPONSE"],
+  is_enriched ~ te_label,
+  value.var = "count",
+  fill = 0L
+)
+ifn_gamma_tbl <- as.matrix(ifn_gamma_tbl, rownames = "is_enriched")
+ifn_gamma_test <- prop.trend.test(x = ifn_gamma_tbl[2, ], n = colSums(ifn_gamma_tbl))
+
+# inflam
+inflam_tbl <- dcast(
+  enrich_counts[pathway == "HALLMARK_INFLAMMATORY_RESPONSE"],
+  is_enriched ~ te_label,
+  value.var = "count",
+  fill = 0L
+)
+inflam_tbl <- as.matrix(inflam_tbl, rownames = "is_enriched")
+inflam_test <- prop.trend.test(x = inflam_tbl[2, ], n = colSums(inflam_tbl))
+```
+
+Show plots of proportions
+
+```{r}
+# png(here(figures, "te-prop-trend.png"), width = 12, height = 5, units = "in", res = 300)
+pdf(here(figures, "te-prop-trend.pdf"), width = 12, height = 5)
+par(mfrow = c(1, 3), mar = c(5, 5, 4, 2) + 0.1)
+# Interferon Alpha
+p <- barplot(
+  ifn_alpha_tbl[2, ] / colSums(ifn_alpha_tbl),
+  xlab = NULL,
+  ylab = "Proportion of Contrasts Enriched",
+  main = "Interferon Alpha Response",
+  col = "cornflowerblue",
+  ylim = c(0, 0.4),
+  cex.lab = 1.8,
+  cex.axis = 1.5,
+  cex.main = 2,
+  cex.names = 1.5
+)
+lines(x = p, y = (ifn_alpha_tbl[2, ] / colSums(ifn_alpha_tbl)))
+points(x = p, y = (ifn_alpha_tbl[2, ] / colSums(ifn_alpha_tbl)), pch = 16, cex = 1.5)
+text(
+  x = p,
+  y = (ifn_alpha_tbl[2, ] / colSums(ifn_alpha_tbl)) + 0.02,
+  labels = paste(ifn_alpha_tbl[2, ], "/", colSums(ifn_alpha_tbl)),
+  cex = 1.5
+)
+
+# Interferon Gamma
+p <- barplot(
+  ifn_gamma_tbl[2, ] / colSums(ifn_gamma_tbl),
+  xlab = "Percentage TE Up-Regulation",
+  ylab = NULL,
+  main = "Interferon Gamma Response",
+  col = "cornflowerblue",
+  ylim = c(0, 0.4),
+  cex.lab = 1.8,
+  cex.axis = 1.5,
+  cex.main = 2,
+  cex.names = 1.5
+)
+lines(x = p, y = (ifn_gamma_tbl[2, ] / colSums(ifn_gamma_tbl)))
+points(x = p, y = (ifn_gamma_tbl[2, ] / colSums(ifn_gamma_tbl)), pch = 16, cex = 1.5)
+text(
+  x = p,
+  y = (ifn_gamma_tbl[2, ] / colSums(ifn_gamma_tbl)) + 0.02,
+  labels = paste(ifn_gamma_tbl[2, ], "/", colSums(ifn_gamma_tbl)),
+  cex = 1.5
+)
+
+# Inflammatory response
+# Interferon Gamma
+p <- barplot(
+  inflam_tbl[2, ] / colSums(inflam_tbl),
+  xlab = NULL,
+  ylab = NULL,
+  main = "Inflammatory Response",
+  col = "cornflowerblue",
+  ylim = c(0, 0.4),
+  cex.lab = 1.8,
+  cex.axis = 1.5,
+  cex.main = 2,
+  cex.names = 1.5
+)
+lines(x = p, y = (inflam_tbl[2, ] / colSums(inflam_tbl)))
+points(x = p, y = (inflam_tbl[2, ] / colSums(inflam_tbl)), pch = 16, cex = 1.5)
+text(
+  x = p,
+  y = (inflam_tbl[2, ] / colSums(inflam_tbl)) + 0.02,
+  labels = paste(inflam_tbl[2, ], "/", colSums(inflam_tbl)),
+  cex = 1.5
+)
+dev.off()
+```
+
+Alternative plot showing all counts in 'Enriched' and 'Not enriched'. The previous plot is clearer
+in it's intent. 
+
+```{r}
+# Labels for strip text
+pathway_names <- c(
+  "HALLMARK_INTERFERON_ALPHA_RESPONSE" = "Interferon Alpha Response",
+  "HALLMARK_INTERFERON_GAMMA_RESPONSE" = "Interferon Gamma Response",
+  "HALLMARK_INFLAMMATORY_RESPONSE" = "Inflammatory Response"
+)
+
+ggplot(enrich_counts, aes(te_label, Prop, fill = is_enriched, label = n_label)) +
+  geom_col(alpha = 0.9, color = "black", position = position_dodge()) +
+  geom_text(position = position_dodge(width = 0.9), vjust = -1) +
+  scale_fill_manual(values = c("Not Enriched" = "grey80", "Enriched" = "red2")) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 0.35)) +
+  facet_wrap(~pathway, labeller = as_labeller(pathway_names)) +
+  labs(x = "Percentage of TEs Up-regulated", y = "Proportion of All Contrasts", fill = NULL) +
+  guides(fill = guide_legend(position = "inside")) +
+  theme_classic() +
+  theme(
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 18),
+    strip.background = element_blank(),
+    panel.grid.major.y = element_line(color = "grey90", linetype = 2),
+    panel.grid.minor.y = element_line(color = "grey90", linetype = 2),
+    legend.text = element_text(size = 14),
+    legend.position.inside = c(0.5, 0.90)
+  )
+ggsave(here(figures, "te-enrichment-props.png"), width = 12, height = 6, dpi = 600)
+ggsave(here(figures, "te-enrichment-props.pdf"), width = 12, height = 6)
+```

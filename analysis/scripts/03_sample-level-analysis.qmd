@@ -1,0 +1,854 @@
+---
+title: "Pool all sample-level counts into a single object"
+author: Gennaro Calendo
+format: html
+---
+
+## Set up
+
+```{r}
+suppressPackageStartupMessages(library(here))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(edgeR))
+suppressPackageStartupMessages(library(SummarizedExperiment))
+suppressPackageStartupMessages(library(patchwork))
+suppressPackageStartupMessages(library(paletteer))
+
+
+datafiles <- here("analysis", "results", "data-files", "03")
+figures <- here("analysis", "results", "figures", "03")
+rdsfiles <- here("analysis", "results", "rds-files", "03")
+
+invisible(sapply(
+  c(datafiles, figures, rdsfiles),
+  dir.create,
+  showWarnings = FALSE,
+  recursive = TRUE
+))
+```
+
+## Get a list of all processed data
+
+These are the `MultiAssayExperiments` containing tximport counts
+
+```{r}
+maefiles <- list.files(
+  path = here("bioprojects"),
+  pattern = "MultiAssayExperiment.rds",
+  full.names = TRUE,
+  recursive = TRUE
+)
+names(maefiles) <- regmatches(maefiles, regexpr("PRJNA[0-9]+", maefiles))
+```
+
+## Extract counts and metadata
+
+```{r}
+extractData <- function(x) {
+  mae <- readRDS(x)
+  genes <- MultiAssayExperiment::assay(mae, "gene counts")
+  repeats <- MultiAssayExperiment::assay(mae, "RE counts")
+  counts <- rbind(genes, repeats)
+  metadata <- MultiAssayExperiment::colData(mae)
+
+  return(list(counts = counts, metadata = metadata))
+}
+```
+
+Extract all counts and metadata into a single sample-level `SummarizedExperiment`
+
+```{r}
+run <- FALSE
+if (run) {
+  suppressPackageStartupMessages(library(MultiAssayExperiment))
+
+  data <- parallel::mclapply(maefiles, extractData, mc.cores = 32)
+
+  all_counts <- lapply(data, `[[`, "counts")
+  all_counts <- do.call(cbind, all_counts)
+
+  all_metadata <- lapply(data, `[[`, "metadata")
+  all_metadata <- lapply(all_metadata, \(x) {
+    as.data.table(data.frame(x), keep.rownames = "Run")
+  })
+  all_metadata <- rbindlist(all_metadata, fill = TRUE)
+  setDF(all_metadata, rownames = all_metadata$Run)
+
+  run_se <- SummarizedExperiment(
+    assays = list(
+      counts = all_counts,
+      logcounts = edgeR::cpm(all_counts, log = TRUE)
+    ),
+    colData = all_metadata
+  )
+
+  saveRDS(run_se, here(rdsfiles, "run-se.rds"))
+}
+```
+
+## Aggragate to the BioSample level
+
+Sum counts to the biosample level for each run
+
+```{r}
+run <- FALSE
+if (run) {
+  # Read in the run-level data
+  run_se <- readRDS(here(rdsfiles, "run-se.rds"))
+
+  # Sum count for each run to the BioSample level
+  counts <- sumTechReps(assay(run_se, "counts"), ID = run_se$BioSample)
+
+  # Collapse the metadata to the BioSample level as well
+  metadata <- as.data.table(data.frame(colData(run_se)))
+  keep_cols <- c(
+    "Run",
+    "BioSample",
+    "BioProject",
+    "library_types",
+    "frag_dist_length",
+    "frag_length_mean",
+    "num_eq_classes",
+    "num_processed",
+    "num_mapped",
+    "num_decoy_fragments",
+    "num_dovetail_fragments",
+    "num_fragments_filtered_vm",
+    "num_alignments_below_threshold_for_mapped_fragments_vm",
+    "percent_mapped",
+    "group"
+  )
+  metadata <- metadata[, ..keep_cols]
+  metadata <- metadata[,
+    .(
+      library_types = paste(unique(library_types), collapse = ";"),
+      avg_frag_dist_length = mean(frag_dist_length),
+      avg_frag_length_mean = mean(frag_length_mean),
+      avg_num_eq_classes = mean(num_eq_classes),
+      avg_num_processed = mean(num_processed),
+      avg_num_mapped = mean(num_mapped),
+      avg_num_decoy_fragments = mean(num_decoy_fragments),
+      avg_num_dovetail_fragments = mean(num_dovetail_fragments),
+      avg_num_fragments_filtered_vm = mean(num_fragments_filtered_vm),
+      avg_num_alignments_below_threshold_for_mapped_fragments_vm = mean(
+        num_alignments_below_threshold_for_mapped_fragments_vm
+      ),
+      avg_percent_mapped = mean(percent_mapped),
+      N_runs = .N
+    ),
+    by = .(BioSample, BioProject, group)
+  ]
+
+  # Classify as single or paired-end libraries
+  metadata[,
+    library_layout := data.table::fifelse(
+      library_types %like% "^[IOM]",
+      "PAIRED",
+      "SINGLE"
+    )
+  ]
+
+  setDF(metadata, rownames = metadata$BioSample)
+  metadata <- metadata[colnames(counts), ]
+
+  # Save as SummarizedExperiment
+  se <- SummarizedExperiment(
+    assays = list(counts = counts, logcounts = cpm(counts, log = TRUE)),
+    colData = metadata
+  )
+
+  saveRDS(se, here(rdsfiles, "biosample-se.rds"))
+} else {
+  se <- readRDS(here(rdsfiles, "biosample-se.rds"))
+}
+```
+
+## Show alignment stat distributions
+
+```{r}
+getMadCutoff <- function(x, threshold = 3) {
+  MAD <- mad(x, na.rm = TRUE)
+  cmedian <- median(x, na.rm = TRUE)
+  lower <- cmedian - (threshold * MAD)
+  upper <- cmedian + (threshold * MAD)
+  return(list(upper = upper, lower = lower))
+}
+
+plotStat <- function(x, title, paired = TRUE, log_stat = TRUE, ...) {
+  if (isTRUE(paired)) {
+    X <- colData(se)[se$library_layout == "PAIRED", ][[x]]
+  } else {
+    X <- colData(se)[se$library_layout == "SINGLE", ][[x]]
+  }
+
+  if (log_stat) {
+    X <- log10(X)
+  }
+
+  hist(
+    X,
+    breaks = 50,
+    main = title,
+    col = "cornflowerblue",
+    border = "white",
+    ylab = "Number of BioSamples",
+    ...
+  )
+  abline(v = getMadCutoff(X)[[1]], col = "red", lty = 2)
+  abline(v = getMadCutoff(X)[[2]], col = "red", lty = 2)
+}
+```
+
+Show histograms of the mapping stats
+
+```{r}
+# png(
+#   here(figures, "paired-mapping-stats.png"),
+#   width = 10,
+#   height = 6,
+#   units = "in",
+#   res = 500
+# )
+pdf(
+  here(figures, "paired-mapping-stats.pdf"),
+  width = 10,
+  height = 6
+)
+par(mfrow = c(2, 3))
+plotStat(
+  "avg_percent_mapped",
+  "Percentage Mapped",
+  log_stat = FALSE,
+  xlab = "Percent Mapped"
+)
+plotStat("avg_num_mapped", "Number Mapped", xlab = "Number Mapped (log10)")
+plotStat(
+  "avg_num_eq_classes",
+  "Number Equivalence Classes",
+  xlab = "Number Eq. Classes (log10)"
+)
+plotStat(
+  "avg_num_decoy_fragments",
+  "Number Decoy Fragments",
+  xlab = "Number Decoy Fragments (log10)"
+)
+plotStat(
+  "avg_num_dovetail_fragments",
+  "Number Dovetail Fragments",
+  xlab = "Number Dovetail Fragments (log10)"
+)
+plotStat(
+  "avg_num_fragments_filtered_vm",
+  "Number Filtered Fragments",
+  xlab = "Number Filtered Fragments (log10)"
+)
+dev.off()
+
+# png(
+#   here(figures, "single-mapping-stats.png"),
+#   width = 10,
+#   height = 6,
+#   units = "in",
+#   res = 500
+# )
+pdf(
+  here(figures, "single-mapping-stats.pdf"),
+  width = 10,
+  height = 6
+)
+par(mfrow = c(2, 3))
+plotStat(
+  "avg_percent_mapped",
+  "Percentage Mapped",
+  paired = FALSE,
+  log_stat = FALSE,
+  xlab = "Percent Mapped"
+)
+plotStat(
+  "avg_num_mapped",
+  "Number Mapped",
+  paired = FALSE,
+  xlab = "Number Mapped (log10)"
+)
+plotStat(
+  "avg_num_eq_classes",
+  "Number Equivalence Classes",
+  paired = FALSE,
+  xlab = "Number Eq. Classes (log10)"
+)
+plotStat(
+  "avg_num_decoy_fragments",
+  "Number Decoy Fragments",
+  paired = FALSE,
+  xlab = "Number Decoy Fragments (log10)"
+)
+plotStat(
+  "avg_num_fragments_filtered_vm",
+  "Number Filtered Fragments",
+  paired = FALSE,
+  xlab = "Number Filtered Fragments (log10)"
+)
+dev.off()
+```
+
+## Flag and remove outliers based on mapping stats
+
+Outliers should be flagged by library layout type. Convert metadata to data.table for grouping.
+
+```{r}
+coldata <- as.data.table(data.frame(colData(se)))
+coldata[,
+  `:=`(
+    avg_num_mapped_outlier = coriell::outliers_by_mad(log10(avg_num_mapped), direction = "low"),
+    avg_percent_mapped_outlier = coriell::outliers_by_mad(avg_percent_mapped, direction = "low"),
+    avg_num_eq_classes_outlier = coriell::outliers_by_mad(
+      log10(avg_num_eq_classes),
+      direction = "low"
+    ),
+    avg_num_decoy_fragments_outlier = coriell::outliers_by_mad(log10(avg_num_decoy_fragments)),
+    avg_num_fragments_filtered_vm_outlier = coriell::outliers_by_mad(
+      log10(avg_num_fragments_filtered_vm),
+      direction = "high"
+    )
+  ),
+  by = library_layout
+]
+
+# Flag is number or percentage mapped is too low
+coldata[, outlier := (avg_num_mapped_outlier | avg_percent_mapped_outlier)]
+
+# Assign back to SE object
+stopifnot(all(coldata$BioSample == colnames(se)))
+se <- se[, coldata$outlier == FALSE]
+```
+
+## Determine control samples
+
+I will have to use the design and contrasts matrices to determine which samples were used as 
+controls. All of the objects have a fit object that contains both a contrasts matrix and a design 
+matrix
+
+```{r}
+result_sefiles <- list.files(
+  path = here("bioprojects"),
+  pattern = "se.rds",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+names(result_sefiles) <- regmatches(
+  result_sefiles,
+  regexpr("PRJNA[0-9]+", result_sefiles)
+)
+```
+
+I will need separate functions for designs with intercepts vs designs without.
+
+```{r}
+# Test cases with and without intercepts
+test_wi <- metadata(readRDS(result_sefiles[[6]]))$fit
+test_wo <- metadata(readRDS(result_sefiles[["PRJNA318019"]]))$fit
+
+# Extract the BioSample IDs for controls samples with a no intercept design
+getControlsWithoutIntercept <- function(x) {
+  cons <- colnames(x$contrasts)
+  groups <- rownames(x$contrasts)
+  is_control <- apply(x$contrasts, 2, \(x) which(x < 0), simplify = TRUE)
+
+  if (is.list(is_control)) {
+    is_control <- unique(unlist(is_control))
+  }
+
+  control_groups <- unique(groups[is_control])
+  control_design <- x$design[, control_groups, drop = F][
+    rowSums(x$design[, control_groups, drop = F]) > 0,
+    ,
+    drop = F
+  ]
+  control_samples <- rownames(control_design)
+
+  return(control_samples)
+}
+
+# Test case
+getControlsWithoutIntercept(test_wo)
+
+# Extract the BioSample IDs for controls with intercept models
+getControlsWithIntercept <- function(x) {
+  cons <- colnames(x$contrasts)
+  groups <- rownames(x$contrasts[rowSums(x$contrasts) > 0, ])
+  trt_design <- x$design[, groups, drop = F]
+  control_samples <- rownames(trt_design[rowSums(trt_design) == 0, , drop = F])
+
+  return(control_samples)
+}
+
+# Test case
+getControlsWithIntercept(test_wi)
+```
+
+Extract BioSample IDs of control samples.
+
+```{r}
+getControls <- function(x) {
+  obj <- readRDS(x)
+  fit <- metadata(obj)$fit
+
+  tryCatch(
+    {
+      if ("(Intercept)" %in% colnames(fit$design)) {
+        controls <- getControlsWithIntercept(fit)
+      } else {
+        controls <- getControlsWithoutIntercept(fit)
+      }
+
+      return(controls)
+    },
+    error = function(e) return(NULL)
+  )
+}
+
+controls <- parallel::mclapply(result_sefiles, getControls, mc.cores = 32)
+controls <- unlist(controls)
+```
+
+### Filter the se object for control samples only
+
+```{r}
+se <- se[, se$BioSample %chin% controls]
+```
+
+## Map cell types back to BioSamples
+
+All of the contrasts have been annotated with the cell types they were derived from. Some may 
+have multiple cell types, i.e. contrasts testing for an overall effect. These can be removed. To 
+map back from the contrast metadata (which is curated) to the BioSample level (minimally curated), 
+we need to link contrasts to BioSamples. I'll have to create tables mapping contrast -> group 
+-> BioSample. The contrast map will contain many more rows than the contrasts in the database 
+because all samples within a particular group will be replicated and some samples may belong to 
+more than one group.
+
+```{r}
+getContrastMapping <- function(x) {
+  obj <- readRDS(x)
+  fit <- metadata(obj)$fit
+
+  # Get the unique mapping between contrasts and groups
+  contrasts <- as.data.table(fit$contrasts, keep.rownames = "group")
+  contrasts <- melt(
+    contrasts,
+    id.vars = "group",
+    variable.factor = FALSE,
+    variable.name = "contrast"
+  )
+  contrasts <- unique(contrasts[value != 0, .(group, contrast)])
+
+  # Get the mapping between BioSamples and groups
+  design <- as.data.table(fit$design, keep.rownames = "BioSample")
+  design <- melt(
+    design,
+    id.vars = "BioSample",
+    variable.factor = FALSE,
+    variable.name = "group"
+  )
+  design <- design[value == 1L, .(BioSample, group)]
+
+  # Map Contrasts -> groups -> BioSamples
+  result <- merge(
+    contrasts,
+    design,
+    by = "group",
+    all.x = TRUE,
+    allow.cartesian = TRUE
+  )
+
+  setorder(result, BioSample)
+}
+```
+
+```{r}
+contrast_map <- parallel::mclapply(
+  result_sefiles,
+  getContrastMapping,
+  mc.cores = 32
+)
+contrast_map <- rbindlist(contrast_map, idcol = "BioProject")
+contrast_map[, id := paste(BioProject, contrast, sep = ".")]
+```
+
+## Get the contrast metadata and map information onto BioSamples
+ 
+```{r}
+# We only need the metadata shell, not the entire SE object
+db <- readRDS("appdata/se_hdf5/se.rds")
+contrast_metadata <- as.data.table(data.frame(colData(db)))
+
+# Remove contrasts with multiple cell lines
+contrast_metadata <- contrast_metadata[cell_line != "MULTIPLE"]
+
+# Map contrast metadata to BioSample information - some may be dropped that were QC filtered
+biosample_metadata <- contrast_map[contrast_metadata, on = "id"]
+
+# Filter for unique BioSample-level information
+keep_cols <- c(
+  "BioSample",
+  "cell_line",
+  "stripped_cell_line",
+  "depmap_model_type",
+  "oncotree_lineage",
+  "oncotree_primary_disease",
+  "oncotree_subtype",
+  "oncotree_code",
+  "sample_collection_site",
+  "ccle_name"
+)
+
+biosample_metadata <- unique(biosample_metadata[, ..keep_cols])
+setDF(biosample_metadata, rownames = biosample_metadata$BioSample)
+```
+
+Replace the old colData in the SE object
+
+```{r}
+new_coldata <- merge(
+  colData(se),
+  biosample_metadata,
+  by = "BioSample",
+  all.x = TRUE
+)
+rownames(new_coldata) <- new_coldata$BioSample
+new_coldata <- new_coldata[colnames(se), ]
+
+# Add onto control Biosample SE object
+colData(se) <- NULL
+colData(se) <- new_coldata
+```
+
+We can also remove any sample from PRIMARY cells and the samples from hTERT cells and samples
+not annotated by CCLE.
+
+```{r}
+# Samples that were processed but not included in the final db do not have cell line anno
+se <- se[, !is.na(se$cell_line)]
+
+# Remove any control samples from primary cells
+se <- se[, !se$cell_line %like% "PRIMARY"]
+
+# hTERT samples do not have oncotree lineage
+se <- se[, se$oncotree_lineage != ""]
+
+# Samples with CCLE annotations
+se <- se[, se$ccle_name != ""]
+```
+
+## Dimensionality Reduction on the TEDEdb control samples
+
+### Filter for expression
+
+First, keep only genes and 'main' TE families
+
+```{r}
+gtf_gr <- readRDS(
+  "/mnt/data/gdata/human/REdiscoverTE_hg38/gencode.v26.annotation.gtf.rds"
+)
+coding <- gtf_gr[gtf_gr$type == "gene" & gtf_gr$gene_type == "protein_coding", ]
+coding <- unique(coding$gene_name)
+
+keep_gene <- rownames(se)[rownames(se) %chin% coding]
+keep_te <- rownames(se)[
+  rownames(se) %like% "^LINE\\.|^SINE\\.|^LTR\\.|.*\\.SVA\\..*|^DNA\\."
+]
+
+keep_feature <- c(keep_gene, keep_te)
+```
+
+Now filter for expression based on the primary cancer lineage. Increase the trim for TMM 
+normalization to account for cell line differences
+
+```{r}
+y <- SE2DGEList(se)
+y <- y[rownames(y) %chin% keep_feature, ]
+
+keep <- filterByExpr(y, group = y$samples2$oncotree_lineage)
+y <- y[keep, ]
+
+y <- normLibSizes(y, method = "TMM", logratioTrim = 0.5)
+lcpms <- cpm(y, log = TRUE)
+```
+
+### Perform PCA on genes and TEs separately
+
+Both represent ~80% total variance captured 
+
+```{r}
+# ~80% Variance
+pca.genes <- PCAtools::pca(
+  mat = lcpms[rownames(lcpms) %chin% coding, ],
+  metadata = y$samples,
+  center = TRUE,
+  scale = TRUE,
+  removeVar = 0.8,
+  rank = 50,
+  BSPARAM = BiocSingular::FastAutoParam()
+)
+
+# ~80% Variance
+pca.tes <- PCAtools::pca(
+  mat = lcpms[!rownames(lcpms) %chin% coding, ],
+  metadata = y$samples,
+  center = TRUE,
+  scale = TRUE,
+  removeVar = 0.5,
+  rank = 100,
+  BSPARAM = BiocSingular::FastAutoParam()
+)
+```
+
+Show PCA biplots
+
+```{r}
+b1 <- PCAtools::biplot(
+  pca.genes,
+  colby = "oncotree_lineage",
+  lab = NULL,
+  title = "Protein Coding Genes",
+  pointSize = 0.8,
+  legendPosition = "right"
+) +
+  labs(color = "OncoTree Lineage") +
+  scale_color_paletteer_d("ggsci::default_igv")
+
+b2 <- PCAtools::biplot(
+  pca.tes,
+  colby = "oncotree_lineage",
+  lab = NULL,
+  title = "TEs",
+  pointSize = 0.8,
+  legendPosition = "right"
+) +
+  labs(color = "OncoTree Lineage") +
+  scale_color_paletteer_d("ggsci::default_igv")
+
+(b1 | b2) +
+  plot_layout(guides = "collect") &
+  guides(color = guide_legend(ncol = 1))
+ggsave(here(figures, "pca-biplots.png"), width = 20, height = 8, dpi = 600)
+```
+
+Perform UMAP on the PC data
+
+```{r}
+udata.genes <- uwot::umap(
+  pca.genes$rotated,
+  n_neighbors = 50,
+  min_dist = 2,
+  seed = 42
+)
+udata.genes <- cbind(data.frame(udata.genes), y$samples)
+
+udata.tes <- uwot::umap(
+  pca.tes$rotated,
+  n_neighbors = 50,
+  min_dist = 2,
+  seed = 42
+)
+udata.tes <- cbind(data.frame(udata.tes), y$samples)
+```
+
+Show UMAPs for genes and TEs
+
+```{r}
+lin_pal <- c(
+  '#e6194b',
+  '#3cb44b',
+  '#ffe119',
+  '#4363d8',
+  '#f58231',
+  '#911eb4',
+  '#46f0f0',
+  '#f032e6',
+  '#bcf60c',
+  '#fabebe',
+  '#008080',
+  '#e6beff',
+  '#9a6324',
+  '#fffac8',
+  '#800000',
+  '#aaffc3',
+  '#808000',
+  '#000075'
+)
+names(lin_pal) <- levels(factor(y$samples$oncotree_lineage))
+
+plotUmap <- function(x, colby, color_pal, plot_title = "") {
+  plot.new()
+  plot.window(xlim = range(x$X1), ylim = range(x$X2))
+  grid()
+  points(x$X1, x$X2, bg = color_pal[x[[colby]]], pch = 21, cex = 1.5)
+  title(xlab = "UMAP1", adj = 0.1, font.lab = 2, cex.lab = 1.5)
+  title(ylab = "UMAP2", adj = 0.1, font.lab = 2, cex.lab = 1.5)
+  title(main = plot_title, adj = 0, font.main = 2, cex.main = 2)
+}
+
+# png(here(figures, "umap_lineage.png"), width = 18, height = 6, units = "in", res = 600)
+pdf(here(figures, "umap_lineage.pdf"), width = 18, height = 6)
+par(mfrow = c(1, 3))
+plotUmap(udata.genes, colby = "oncotree_lineage", lin_pal, "Protein Coding Genes")
+plotUmap(udata.tes, colby = "oncotree_lineage", lin_pal, "TEs")
+
+# Add legend as new plot area
+plot.new()
+plot.window(xlim = c(0, 0.5), ylim = c(1, 10))
+legend(
+  0,
+  10,
+  legend = names(lin_pal),
+  col = lin_pal,
+  pch = 19,
+  bty = "n",
+  cex = 1.5,
+  title = "OncoTree Lineage",
+  title.font = 2,
+  title.adj = 0
+)
+dev.off()
+```
+
+Color by BioProject
+
+```{r}
+prj_pal <- hcl.colors(n = length(unique(y$samples$BioProject)), palette = "viridis")
+names(prj_pal) <- levels(factor(y$samples$BioProject))
+
+# png(here(figures, "umap_bioproject.png"), width = 16, height = 8, units = "in", res = 600)
+pdf(here(figures, "umap_bioproject.pdf"), width = 16, height = 8)
+par(mfrow = c(1, 2))
+plotUmap(udata.genes, colby = "BioProject", prj_pal, "Protein Coding Genes")
+plotUmap(udata.tes, colby = "BioProject", prj_pal, "TEs")
+dev.off()
+```
+
+Color by primary disease
+
+```{r}
+dis_pal <- as.character(paletteer_d(
+  "ggsci::default_igv",
+  n = length(unique(y$samples$oncotree_primary_disease))
+))
+names(dis_pal) <- levels(factor(y$samples$oncotree_primary_disease))
+
+png(here(figures, "umap_disease.png"), width = 18, height = 6, units = "in", res = 600)
+par(mfrow = c(1, 3))
+plotUmap(udata.genes, "oncotree_primary_disease", dis_pal, "Protein Coding Genes")
+plotUmap(udata.tes, "oncotree_primary_disease", dis_pal, "TEs")
+
+# Add legend as new plot area
+plot.new()
+plot.window(xlim = c(0, 0.5), ylim = c(1, 10))
+legend(
+  0,
+  10,
+  legend = names(dis_pal),
+  col = dis_pal,
+  pch = 19,
+  bty = "n",
+  cex = 1,
+  title = "Primary Disease",
+  title.font = 2,
+  title.adj = 0
+)
+dev.off()
+```
+
+## Create highlight images to see what the trends are per lineage
+
+```{r}
+ggplot(udata.genes, aes(X1, X2, color = oncotree_lineage)) +
+  geom_point(size = 0.8) +
+  gghighlight::gghighlight(
+    use_direct_label = FALSE,
+    unhighlighted_params = list(colour = alpha("grey", 0.7))
+  ) +
+  guides(color = "none") +
+  facet_wrap(~oncotree_lineage) +
+  labs(x = "UMAP 1", y = "UMAP 2") +
+  scale_color_manual(values = lin_pal) +
+  coriell::theme_coriell() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+ggsave(here(figures, "umap-highlighted_genes.png"), width = 20, height = 12, dpi = 600)
+
+# And for TEs
+ggplot(udata.tes, aes(X1, X2, color = oncotree_lineage)) +
+  geom_point(size = 0.8) +
+  gghighlight::gghighlight(
+    use_direct_label = FALSE,
+    unhighlighted_params = list(colour = alpha("grey", 0.7))
+  ) +
+  guides(color = "none") +
+  facet_wrap(~oncotree_lineage) +
+  labs(x = "UMAP 1", y = "UMAP 2") +
+  scale_color_manual(values = lin_pal) +
+  coriell::theme_coriell() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+ggsave(here(figures, "umap-highlighted_tes.png"), width = 20, height = 12, dpi = 600)
+```
+
+## Evaluate performance of TEs and Gene 'clusters'
+
+Here the goal is to test if the variance explained by batch is greater in the TEs than in the genes.
+To do this, estimate the variance explained by BioProject and then lineage using PERMANOVA.
+
+```{r}
+set.seed(123)
+
+# Compoute euclidean distance between samples
+d_genes <- vegan::vegdist(pca.genes$rotated, method = "euclidean")
+d_tes <- vegan::vegdist(pca.tes$rotated, method = "euclidean")
+
+# Compute PERMANOVA to get variance explained
+BioProject <- pca.genes$metadata$BioProject
+Lineage <- pca.genes$metadata$oncotree_lineage
+
+permanova_genes <- vegan::adonis2(
+  d_genes ~ Lineage + BioProject,
+  by = "terms",
+  permutations = 1e3,
+  parallel = 48
+)
+
+permanova_tes <- vegan::adonis2(
+  d_tes ~ Lineage + BioProject,
+  by = "terms",
+  permutations = 1e3,
+  parallel = 48
+)
+```
+
+Extract and show stats
+
+```{r}
+r2_genes <- permanova_genes$R2[1]
+p_genes <- permanova_genes$`Pr(>F)`[1]
+
+cat("Gene Expression PERMANOVA:\n")
+cat("R-squared:", round(r2_genes, 4), "| p-value:", p_genes, "\n\n")
+
+r2_tes <- permanova_tes$R2[1]
+p_tes <- permanova_tes$`Pr(>F)`[1]
+
+cat("TE Expression PERMANOVA:\n")
+cat("R-squared:", round(r2_tes, 4), "| p-value:", p_tes, "\n")
+```

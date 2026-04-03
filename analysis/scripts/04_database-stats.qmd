@@ -1,0 +1,1001 @@
+---
+title: Collect overall database stats
+author: Gennaro Calendo
+format: html
+---
+
+## Set up
+
+```{r}
+suppressPackageStartupMessages(library(here))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(SummarizedExperiment))
+suppressPackageStartupMessages(library(patchwork))
+suppressPackageStartupMessages(library(paletteer))
+suppressPackageStartupMessages(library(Ternary))
+suppressPackageStartupMessages(library(gt))
+suppressPackageStartupMessages(library(glmmTMB))
+
+datafiles <- here("analysis", "results", "data-files", "04")
+figures <- here("analysis", "results", "figures", "04")
+rdsfiles <- here("analysis", "results", "rds-files", "04")
+
+invisible(sapply(
+  c(datafiles, figures, rdsfiles),
+  dir.create,
+  showWarnings = F,
+  recursive = T
+))
+```
+
+## Create pie charts for overview dashboard
+
+```{r}
+# Read in the shell data
+se <- readRDS(here("appdata", "se_hdf5", "se.rds"))
+
+# Extract contrast-level data as data.table
+rd <- as.data.table(data.frame(colData(se)))
+
+# Get the unique number of contrasts for each variable
+experiments <- rd[, .N, by = experiment][order(N, decreasing = TRUE)]
+contrasts <- rd[, .N, by = contrast][order(N, decreasing = TRUE)]
+cell_lines <- rd[, .N, by = cell_line][order(N, decreasing = TRUE)]
+cancer_types <- rd[, .N, by = oncotree_primary_disease][order(
+  N,
+  decreasing = TRUE
+)]
+treatments <- rd[, .N, by = treatment][order(N, decreasing = TRUE)]
+
+# Now get the top records for each
+top_contrasts <- rd[,
+  lapply(.SD, forcats::fct_lump_n, n = 5),
+  .SDcols = c("cell_line", "oncotree_primary_disease", "treatment")
+]
+
+plot_donut <- function(var, hsize = 2) {
+  df <- data.frame(table(top_contrasts[[var]]))
+
+  ggplot(df, aes(x = hsize, y = Freq, fill = Var1)) +
+    geom_col(color = "black") +
+    geom_text(aes(label = Freq), position = position_stack(vjust = 0.5)) +
+    coord_polar(theta = "y") +
+    xlim(c(0.2, hsize + 0.5)) +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      panel.grid = element_blank(),
+      axis.title = element_blank(),
+      axis.ticks = element_blank(),
+      axis.text = element_blank(),
+      plot.title = element_text(face = "bold", size = 24)
+    )
+}
+
+p1 <- plot_donut("cell_line") +
+  scale_fill_paletteer_d("ggsci::default_nejm") +
+  labs(title = "Cell Lines", fill = "Cell Line")
+
+p2 <- plot_donut("oncotree_primary_disease") +
+  scale_fill_paletteer_d("ggsci::default_uchicago") +
+  labs(title = "Cancer Types", fill = "Cancer Type")
+
+p3 <- plot_donut("treatment") +
+  scale_fill_paletteer_d("ggsci::default_jama") +
+  labs(title = "Treatments", fill = "Treatment")
+
+(p1 | p2 | p3)
+ggsave(here(figures, "records.pdf"), width = 16, height = 8)
+ggsave(here(figures, "records.png"), width = 16, height = 8, dpi = 600)
+```
+
+## Read in the db data
+
+Now, I need to compute the percentage DE genes/TEs per tissue type, cell line, treatment class, 
+etc. to get overall statistics about the database contents.
+
+```{r}
+de_datafile <- here(rdsfiles, "de-data.fst")
+if (!file.exists(de_datafile)) {
+  suppressPackageStartupMessages(library(HDF5Array))
+  suppressPackageStartupMessages(library(DelayedArray))
+  suppressPackageStartupMessages(library(DelayedMatrixStats))
+
+  db <- loadHDF5SummarizedExperiment("/mnt/data/data_gc/TEDEdb/appdata/se_hdf5")
+  getDeDatafromAssays <- function(x) {
+    filtered <- db[, x]
+    assay_data <- lapply(names(SummarizedExperiment::assays(filtered)), \(x) {
+      SummarizedExperiment::assay(filtered, x)
+    })
+
+    df <- as.data.frame(do.call(SummarizedExperiment::cbind, assay_data))
+    colnames(df) <- names(SummarizedExperiment::assays(filtered))
+    data.table::setDT(df, keep.rownames = "feature_id")
+    df <- df[!is.na(adj.P.Val), ]
+    setorder(df, adj.P.Val)
+
+    return(df)
+  }
+
+  de_data <- parallel::mclapply(db$id, getDeDatafromAssays, mc.cores = 32)
+  names(de_data) <- db$id
+  de_data <- rbindlist(de_data, idcol = "id")
+  fst::write_fst(de_data, de_datafile)
+} else {
+  de_data <- fst::read_fst(de_datafile, as.data.table = TRUE)
+}
+```
+
+## Read in the shell to get the contrast metadata
+
+```{r}
+db <- readRDS(here("appdata", "se_hdf5", "se.rds"))
+meta <- setDT(data.frame(colData(db)))
+```
+
+## Compute the number of up/down/non-de features per contrast
+
+```{r}
+de_data[,
+  is_te := feature_id %like% "^LINE\\.|^SINE\\.|^LTR\\.|.*\\.SVA\\..*|^DNA\\."
+]
+
+de_stats <- de_data[,
+  coriell::summarize_dge(.SD, fdr = 0.1, fdr_col = "adj.P.Val"),
+  by = "id"
+]
+gene_stats <- de_data[
+  is_te == FALSE,
+  coriell::summarize_dge(.SD, fdr = 0.1, fdr_col = "adj.P.Val"),
+  by = "id"
+]
+te_stats <- de_data[
+  is_te == TRUE,
+  coriell::summarize_dge(.SD, fdr = 0.1, fdr_col = "adj.P.Val"),
+  by = "id"
+]
+```
+
+Cast wide and add on metadata
+
+```{r}
+# Cast stats wider so metadata can be joined onto contrasts
+gene_stats.w <- dcast(gene_stats, id ~ Direction, value.var = "N")
+te_stats.w <- dcast(te_stats, id ~ Direction, value.var = "N")
+
+# And join on the metadata
+gene_stats.w <- meta[gene_stats.w, on = "id"]
+te_stats.w <- meta[te_stats.w, on = "id"]
+
+# Remove samples from non-cancer studies
+gene_stats.w <- gene_stats.w[
+  oncotree_primary_disease != "Non-Cancerous" & !is.na(oncotree_primary_disease)
+]
+te_stats.w <- te_stats.w[
+  oncotree_primary_disease != "Non-Cancerous" & !is.na(oncotree_primary_disease)
+]
+
+# Remove any samples from primary or multiple cell lines
+gene_stats.w <- gene_stats.w[!cell_line %like% "^PRIMARY|MULTIPLE"]
+te_stats.w <- te_stats.w[!cell_line %like% "^PRIMARY|MULTIPLE"]
+
+# # Remove non-compound treatments
+drop_mech <- c(
+  "N/A",
+  "small interfering rna",
+  "short hairpin rna",
+  "hyperthermia",
+  "cas9 editing",
+  "control vehicle",
+  "lncrna targeting astin1",
+  "lncrna targeting nkx2",
+  "protac (nonfunctional)",
+  "radiation therapy",
+  "radiation therapy | topoisomerase inhibitor",
+  "sparcle expression",
+  "sparcle expression regulator",
+  "sparcle expression regulator"
+)
+gene_stats.w <- gene_stats.w[
+  clinical_phase != "N/A" & (!mechanism_of_action %chin% drop_mech)
+]
+te_stats.w <- te_stats.w[
+  clinical_phase != "N/A" & (!mechanism_of_action %chin% drop_mech)
+]
+
+# # Drop any contrasts that have been flagged as having outlier samples
+gene_stats.w <- gene_stats.w[outlier_flags == "None"]
+te_stats.w <- te_stats.w[outlier_flags == "None"]
+
+# Also remove 'Compound Kushen Injection' since these are technically combintaions
+gene_stats.w <- gene_stats.w[!treatment %like% 'Compound Kushen Injection']
+te_stats.w <- te_stats.w[!treatment %like% 'Compound Kushen Injection']
+
+# Add DE percentasge
+gene_stats.w[, `:=`(
+  prop_up = Up / (Up + Down + Unperturbed),
+  prop_down = Down / (Up + Down + Unperturbed),
+  prop_non = Unperturbed / (Up + Down + Unperturbed)
+)]
+
+te_stats.w[, `:=`(
+  prop_up = Up / (Up + Down + Unperturbed),
+  prop_down = Down / (Up + Down + Unperturbed),
+  prop_non = Unperturbed / (Up + Down + Unperturbed)
+)]
+```
+
+### Show overall stats
+
+Show a ternary plot with the surface colored by the density of percentage dysregulation
+
+```{r}
+# pdf(here(figures, "contrast-ternary.pdf"), width = 12, height = 6)
+png(
+  here(figures, "contrast-ternary.png"),
+  width = 12,
+  height = 6,
+  units = "in",
+  res = 600
+)
+
+par(mfrow = c(1, 2))
+
+# Genes
+TernaryPlot(
+  alab = "Up-Regulated (%)",
+  blab = "Down-Regulated (%)",
+  clab = "Unchanged (%)",
+  point = "up",
+  lab.cex = 1.2,
+  grid.lines = 10,
+  grid.minor.lines = 0,
+  grid.lty = 3,
+  main = "Protein Coding Genes",
+  cex.main = 1.5
+)
+
+gene_coords <- gene_stats.w[, .(prop_up, prop_down, prop_non)]
+gene_density <- TernaryDensity(gene_coords, resolution = 30L)
+
+# Convert density to absolute numbers
+gene_total_dens <- sum(gene_density["z", ], na.rm = TRUE)
+gene_frac <- gene_density["z", ] / gene_total_dens
+gene_counts <- gene_frac * nrow(gene_stats.w)
+
+# Add back to matrix
+gene_density["z", ] <- round(log10(gene_counts + 1), 1)
+
+ColourTernary(
+  gene_density,
+  spectrum = hcl.colors(30, palette = "Viridis", rev = TRUE),
+  legend = c('1,000', '100', '10', '0'),
+  bty = "n",
+  title = "Number of Contrasts",
+  cex = 0.8
+)
+
+# TEs
+TernaryPlot(
+  alab = "Up-Regulated (%)",
+  blab = "Down-Regulated (%)",
+  clab = "Unchanged (%)",
+  point = "up",
+  lab.cex = 1.2,
+  grid.lines = 10,
+  grid.minor.lines = 0,
+  grid.lty = 3,
+  main = "TE Subfamilies",
+  cex.main = 1.5
+)
+
+te_coords <- te_stats.w[, .(prop_up, prop_down, prop_non)]
+te_density <- TernaryDensity(te_coords, resolution = 30L)
+
+# Convert density to absolute numbers
+te_total_dens <- sum(te_density["z", ], na.rm = TRUE)
+te_frac <- te_density["z", ] / te_total_dens
+te_counts <- te_frac * nrow(te_stats.w)
+
+# Add back to matrix
+te_density["z", ] <- round(log10(te_counts + 1), 1)
+
+ColourTernary(
+  te_density,
+  spectrum = hcl.colors(30, palette = "Viridis", rev = TRUE),
+  legend = c('1,000', '100', '10', '0'),
+  bty = "n",
+  title = "Number of Contrasts",
+  cex = 0.8
+)
+
+dev.off()
+```
+
+## Dysregulation by epigenetic class
+
+```{r}
+gene_by_epi <- gene_stats.w[,
+  .(
+    avg_prop_up = mean(prop_up),
+    avg_prop_down = mean(prop_down),
+    sem_prop_up = sd(prop_up) / sqrt(.N),
+    sem_prop_down = sd(prop_down) / sqrt(.N),
+    N = .N
+  ),
+  by = epigenetic_class_fine
+]
+
+te_by_epi <- te_stats.w[,
+  .(
+    avg_prop_up = mean(prop_up),
+    avg_prop_down = mean(prop_down),
+    sem_prop_up = sd(prop_up) / sqrt(.N),
+    sem_prop_down = sd(prop_down) / sqrt(.N),
+    N = .N
+  ),
+  by = epigenetic_class_fine
+]
+
+# Melt longer for plotting
+gene_by_epi1 <- melt(
+  gene_by_epi,
+  id.vars = c("epigenetic_class_fine", "N"),
+  measure.vars = c("avg_prop_up", "avg_prop_down"),
+  variable.name = "direction",
+  value.name = "avg"
+)
+gene_by_epi2 <- melt(
+  gene_by_epi,
+  id.vars = "epigenetic_class_fine",
+  measure.vars = c("sem_prop_up", "sem_prop_down"),
+  variable.name = "direction",
+  value.name = "sem"
+)
+gene_by_epi <- cbind(gene_by_epi1, gene_by_epi2[, .(sem)])
+
+# And for TEs
+te_by_epi1 <- melt(
+  te_by_epi,
+  id.vars = c("epigenetic_class_fine", "N"),
+  measure.vars = c("avg_prop_up", "avg_prop_down"),
+  variable.name = "direction",
+  value.name = "avg"
+)
+te_by_epi2 <- melt(
+  te_by_epi,
+  id.vars = "epigenetic_class_fine",
+  measure.vars = c("sem_prop_up", "sem_prop_down"),
+  variable.name = "direction",
+  value.name = "sem"
+)
+te_by_epi <- cbind(te_by_epi1, te_by_epi2[, .(sem)])
+
+# Keep only the single classes
+keep_classes <- c("DNMTi", "HMTi", "Non-epigenetic", "HDMi", "HDACi", "PAHi")
+gene_by_epi <- gene_by_epi[epigenetic_class_fine %chin% keep_classes]
+te_by_epi <- te_by_epi[epigenetic_class_fine %chin% keep_classes]
+
+# Invert the down percentages
+gene_by_epi[direction %like% "down", avg := avg * -1]
+te_by_epi[direction %like% "down", avg := avg * -1]
+
+# Swap labels for plotting
+gene_by_epi[,
+  direction := fifelse(direction %like% "up", "Up-regulated", "Down-regulated")
+]
+te_by_epi[,
+  direction := fifelse(direction %like% "up", "Up-regulated", "Down-regulated")
+]
+
+# Create new x-axis labels
+gene_by_epi[, xlabel := paste0(epigenetic_class_fine, "\n(N=", N, ")")]
+te_by_epi[, xlabel := paste0(epigenetic_class_fine, "\n(N=", N, ")")]
+
+# Reorder factor levels
+gene_by_epi[,
+  xlabel := factor(
+    xlabel,
+    levels = c(
+      "DNMTi\n(N=57)",
+      "HMTi\n(N=26)",
+      "Non-epigenetic\n(N=1163)",
+      "HDMi\n(N=9)",
+      "HDACi\n(N=62)",
+      "PAHi\n(N=70)"
+    )
+  )
+]
+te_by_epi[,
+  xlabel := factor(
+    xlabel,
+    levels = c(
+      "DNMTi\n(N=57)",
+      "HMTi\n(N=26)",
+      "Non-epigenetic\n(N=1163)",
+      "HDMi\n(N=9)",
+      "HDACi\n(N=62)",
+      "PAHi\n(N=70)"
+    )
+  )
+]
+```
+
+Show the hanging barplots
+
+```{r}
+# Genes
+p1 <- ggplot(gene_by_epi, aes(x = xlabel, y = avg, fill = direction)) +
+  geom_col(color = "white", width = 0.8) +
+  geom_errorbar(aes(ymin = avg - sem, ymax = avg + sem, width = 0.2)) +
+  scale_fill_manual(
+    values = c("Down-regulated" = "steelblue", "Up-regulated" = "firebrick2")
+  ) +
+  scale_y_continuous(
+    labels = \(x) paste0(abs(x * 100), "%"),
+    limits = c(-0.2, 0.2)
+  ) +
+  labs(
+    title = "Protein Coding Genes",
+    y = "Percentage Dysregulation (mean \u00B1 SEM)",
+    x = NULL,
+    fill = NULL
+  ) +
+  see::theme_radar() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "lightgrey", linetype = 2),
+    plot.title = element_text(size = 18, hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# TEs
+p2 <- ggplot(te_by_epi, aes(x = xlabel, y = avg, fill = direction)) +
+  geom_col(color = "white", width = 0.8) +
+  geom_errorbar(aes(ymin = avg - sem, ymax = avg + sem, width = 0.2)) +
+  scale_fill_manual(
+    values = c("Down-regulated" = "steelblue", "Up-regulated" = "firebrick2")
+  ) +
+  scale_y_continuous(
+    labels = \(x) paste0(abs(x * 100), "%"),
+    limits = c(-0.2, 0.2)
+  ) +
+  labs(
+    title = "TE Subfamilies",
+    y = "Percentage Dysregulation (mean \u00B1 SEM)",
+    x = NULL,
+    fill = NULL
+  ) +
+  see::theme_radar() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "lightgrey", linetype = 2),
+    plot.title = element_text(size = 18, hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+(p1 | p2) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+ggsave(
+  here(figures, "dysregulation-barplot.png"),
+  width = 11,
+  height = 6,
+  dpi = 600
+)
+ggsave(here(figures, "dysregulation-barplot.pdf"), width = 11, height = 6)
+```
+
+## For each epigenetic class, what are the top *compounds* by percentage TE dysregulation?
+
+- Average gene and TE dysregulation by compound
+- Select the top 5-10 from each 
+- Crate a table
+
+```{r}
+te_by_compound <- te_stats.w[
+  epigenetic_class_fine %chin% keep_classes,
+  .(
+    avg_prop_non = mean(prop_non, na.rm = TRUE),
+    avg_prop_up = mean(prop_up, na.rm = TRUE),
+    avg_prop_down = mean(prop_down, na.rm = TRUE),
+    sd_prop_up = sd(prop_up, na.rm = TRUE),
+    sd_prop_down = sd(prop_down, na.rm = TRUE),
+    N = .N,
+    cell_lines = paste(unique(cell_line), collapse = "; "),
+    n_cell_lines = length(unique(cell_line)),
+    lineages = paste(unique(oncotree_lineage), collapse = "; "),
+    bioprojects = paste(unique(experiment), collapse = "; "),
+    n_bioprojects = length(unique(experiment))
+  ),
+  by = .(epigenetic_class_fine, treatment, mechanism_of_action)
+]
+```
+
+### Perform shrinkage on mean estimates to get robust results and CIs
+
+```{r}
+fit.up <- glmmTMB(
+  prop_up ~ 1 + (1 | epigenetic_class_fine / treatment),
+  data = te_stats.w,
+  family = tweedie(link = "log")
+)
+
+fit.down <- glmmTMB(
+  prop_down ~ 1 + (1 | epigenetic_class_fine / treatment),
+  data = te_stats.w,
+  family = tweedie(link = "log")
+)
+
+# Extract the tested compounds
+shrunken_dt <- data.table(trt_class = rownames(coef(fit.up)[[1]][[1]]))
+shrunken_dt[, c("treatment", "epigenetic_class_fine") := tstrsplit(trt_class, ":", fixed = TRUE)][,
+  trt_class := NULL
+]
+
+# Predict the shrunken means
+pred_up <- predict(fit.up, newdata = shrunken_dt, type = "link", se.fit = TRUE)
+pred_down <- predict(fit.down, newdata = shrunken_dt, type = "link", se.fit = TRUE)
+
+# Compute 95% CIs
+up.lower <- pred_up$fit - (1.96 * pred_up$se.fit)
+up.upper <- pred_up$fit + (1.96 * pred_up$se.fit)
+down.lower <- pred_down$fit - (1.96 * pred_down$se.fit)
+down.upper <- pred_down$fit + (1.96 * pred_down$se.fit)
+
+# Exponentiate back to percentage scale
+shrunken_dt[, `:=`(
+  predicted_up = exp(pred_up$fit),
+  up_lower = exp(up.lower),
+  up_upper = exp(up.upper),
+  predicted_down = exp(pred_down$fit),
+  down_lower = exp(down.lower),
+  down_upper = exp(down.upper)
+)]
+```
+
+Join the shrunken data onto the raw data
+
+```{r}
+merged_by_compound <- merge(
+  x = te_by_compound,
+  y = shrunken_dt,
+  by = c("epigenetic_class_fine", "treatment"),
+  all.x = TRUE
+)
+setorder(merged_by_compound, epigenetic_class_fine, -predicted_up)
+
+# Limit to compounds observed in >1 BioProjects
+top_te_by_compound <- merged_by_compound[n_bioprojects > 2]
+```
+
+Create the final table. For now, gt_save() is not producing a nice table. Open in browser and save 
+as pdf.
+
+```{r}
+keep_cols <- c(
+  "treatment",
+  "predicted_up",
+  "up_lower",
+  "up_upper",
+  "predicted_down",
+  "down_lower",
+  "down_upper",
+  "N",
+  "n_cell_lines",
+  "n_bioprojects",
+  "mechanism_of_action"
+)
+
+format_ci <- function(est, lower, upper, digits = 1) {
+  paste0(
+    round(est * 100, digits),
+    "% [",
+    round(lower * 100, digits),
+    " - ",
+    round(upper * 100, digits),
+    "]%"
+  )
+}
+
+# Construct gt table
+tbl <- top_te_by_compound[, ..keep_cols]
+setorder(tbl, -predicted_up)
+tbl[, avg_prop_up := format_ci(predicted_up, up_lower, up_upper)]
+tbl[, avg_prop_down := format_ci(predicted_down, down_lower, down_upper)]
+tbl[, `:=`(
+  predicted_up = NULL,
+  predicted_down = NULL,
+  up_upper = NULL,
+  up_lower = NULL,
+  down_upper = NULL,
+  down_lower = NULL
+)]
+setcolorder(
+  tbl,
+  c(
+    "treatment",
+    "mechanism_of_action",
+    "avg_prop_up",
+    "avg_prop_down",
+    "N",
+    "n_bioprojects",
+    "n_cell_lines"
+  )
+)
+
+# Construct final figure
+gt(tbl) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  cols_align(
+    align = "right",
+    columns = c(avg_prop_up, avg_prop_down)
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(N, n_cell_lines, n_bioprojects, mechanism_of_action)
+  ) |>
+  cols_align(
+    align = "left",
+    columns = c(treatment)
+  ) |>
+  cols_label(
+    mechanism_of_action = "Mechanism of Action",
+    treatment = "Compound",
+    avg_prop_up = "Up-regulation [95% CI]",
+    avg_prop_down = "Down-regulation [95% CI]",
+    N = "Contrasts (N)",
+    n_cell_lines = "Cell Lines (N)",
+    n_bioprojects = "BioProjects (N)"
+  ) |>
+  cols_width(
+    'treatment' ~ px(150),
+    'N' ~ px(150),
+    'n_cell_lines' ~ px(150),
+    'n_bioprojects' ~ px(150)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#FFFFE0"),
+    locations = cells_body(rows = mechanism_of_action %like% "cdk inhibitor")
+  ) |>
+  opt_stylize(style = 1, color = "gray", add_row_striping = FALSE)
+```
+
+## Top dysregulated *features* in each class
+
+### Connect to TEDEdb
+
+```{r}
+db <- HDF5Array::loadHDF5SummarizedExperiment("/mnt/data/data_gc/TEDEdb/appdata/se_hdf5")
+```
+
+### Filter contrasts
+
+Same as above
+
+```{r}
+# Remove samples from non-cancer studies
+db <- db[, db$oncotree_primary_disease != "Non-Cancerous" & !is.na(db$oncotree_primary_disease)]
+
+# Remove any samples from primary or multiple cell lines
+db <- db[, !db$cell_line %like% "^PRIMARY|MULTIPLE"]
+
+# Remove non-compound treatments
+drop_mech <- c(
+  "N/A",
+  "small interfering rna",
+  "short hairpin rna",
+  "hyperthermia",
+  "cas9 editing",
+  "control vehicle",
+  "lncrna targeting astin1",
+  "lncrna targeting nkx2",
+  "protac (nonfunctional)",
+  "radiation therapy",
+  "radiation therapy | topoisomerase inhibitor",
+  "sparcle expression",
+  "sparcle expression regulator",
+  "sparcle expression regulator"
+)
+db <- db[, db$clinical_phase != "N/A" & (!db$mechanism_of_action %chin% drop_mech)]
+
+# # Drop any contrasts that have been flagged as having outlier samples
+db <- db[, db$outlier_flags == "None"]
+
+# Also remove 'Compound Kushen Injection' since these are technically combintaions
+db <- db[, !db$treatment %like% 'Compound Kushen Injection']
+```
+
+### Determine top dysregulated features
+
+Compute the frequency of dysregulation across contrasts per class
+
+```{r}
+deFrequency <- function(x, mechanism = NULL) {
+  if (!is.null(mechanism)) {
+    se <- db[, db$mechanism_of_action == mechanism]
+  } else {
+    se <- db[, db$epigenetic_class_fine == x]
+  }
+
+  is_up <- (assay(se, "logFC") > 0) & (assay(se, "adj.P.Val") < 0.1)
+  is_down <- (assay(se, "logFC") < 0) & (assay(se, "adj.P.Val") < 0.1)
+
+  result <- data.table(
+    feature = rownames(se),
+    n_contrasts = ncol(se),
+    n_up = rowSums(is_up),
+    n_down = rowSums(is_down)
+  )
+
+  result[, n_de := n_up + n_down][, `:=`(
+    percentage_up = n_up / n_contrasts * 100,
+    percentage_down = n_down / n_contrasts * 100,
+    direction_score = (n_up - n_down) / n_de
+  )]
+
+  result[is.na(direction_score), direction_score == 0.0]
+
+  # Base percentage DE on direction of DE
+  result[,
+    percentage_de := fcase(
+      direction_score > 0 , n_up / n_contrasts * 100   ,
+      direction_score < 0 , n_down / n_contrasts * 100 ,
+      default = 0.0
+    )
+  ]
+
+  return(result)
+}
+
+# For each epigenetic class
+freq_results1 <- lapply(keep_classes, deFrequency)
+names(freq_results1) <- keep_classes
+
+# For CDK inhibitors alone
+freq_results2 <- list("CDKi" = deFrequency("", mechanism = "cdk inhibitor"))
+
+# Combine into single DT
+freq_results <- c(freq_results1, freq_results2)
+freq_results_dt <- rbindlist(freq_results, idcol = "epigenetic_class_fine")
+fwrite(freq_results_dt, here(datafiles, "dysregulation-frequencies.tsv"), sep = "\t")
+```
+
+Select the top 10 genes in each subset
+
+```{r}
+lvls <- c("CDKi", keep_classes)
+
+top_genes <- freq_results_dt[
+  !feature %like% ".*\\..*\\..*",
+  head(.SD[order(percentage_de, decreasing = T)], n = 10),
+  by = epigenetic_class_fine
+]
+
+# Get the top genes in each set to highlight on the plot
+top_genes_per_class <- lapply(split(top_genes, by = "epigenetic_class_fine"), `[[`, "feature")
+top_genes_per_class <- top_genes_per_class[lvls]
+
+# Collect all genes to plot
+top_genes_dt <- freq_results_dt[feature %chin% top_genes[, unique(feature)]]
+
+# Reorder to match other plots
+top_genes_dt[, epigenetic_class_fine := factor(epigenetic_class_fine, levels = lvls)]
+```
+
+Repeat for TEs
+
+```{r}
+top_tes <- freq_results_dt[
+  feature %like% ".*\\..*\\..*",
+  head(.SD[order(percentage_de, decreasing = T)], n = 10),
+  by = epigenetic_class_fine
+]
+
+# Get the top TEs in each set
+top_tes_per_class <- lapply(split(top_tes, by = "epigenetic_class_fine"), `[[`, "feature")
+top_tes_per_class <- top_tes_per_class[lvls]
+
+# Collect all TEs to plot
+top_tes_dt <- freq_results_dt[feature %chin% top_tes[, unique(feature)]]
+
+# Relevel to match other plots
+top_tes_dt[, epigenetic_class_fine := factor(epigenetic_class_fine, levels = lvls)]
+```
+
+Determine factor levels of the genes/TEs to reorder by. 
+
+```{r}
+gene_order <- unique(unname(unlist(top_genes_per_class)))
+te_order <- unique(unname(unlist(top_tes_per_class)))
+top_genes_dt[, feature := factor(feature, levels = gene_order)]
+top_tes_dt[, feature := factor(feature, levels = te_order)]
+```
+
+Create a frequency dotplot of the top genes
+
+```{r}
+p1 <- ggplot(top_genes_dt, aes(x = feature, y = epigenetic_class_fine)) +
+  geom_point(aes(size = percentage_de, color = direction_score), shape = 1) +
+  geom_point(
+    data = top_genes_dt[
+      epigenetic_class_fine == "CDKi" & feature %chin% top_genes_per_class[["CDKi"]]
+    ],
+    aes(size = percentage_de, color = direction_score),
+    shape = 16
+  ) +
+  geom_point(
+    data = top_genes_dt[
+      epigenetic_class_fine == "DNMTi" & feature %chin% top_genes_per_class[["DNMTi"]]
+    ],
+    aes(size = percentage_de, color = direction_score),
+    shape = 16
+  ) +
+  geom_point(
+    data = top_genes_dt[
+      epigenetic_class_fine == "HDACi" & feature %chin% top_genes_per_class[["HDACi"]]
+    ],
+    aes(size = percentage_de, color = direction_score),
+    shape = 16
+  ) +
+  geom_point(
+    data = top_genes_dt[
+      epigenetic_class_fine == "HDMi" & feature %chin% top_genes_per_class[["HDMi"]]
+    ],
+    aes(size = percentage_de, color = direction_score),
+    shape = 16
+  ) +
+  geom_point(
+    data = top_genes_dt[
+      epigenetic_class_fine == "HMTi" & feature %chin% top_genes_per_class[["HMTi"]]
+    ],
+    aes(size = percentage_de, color = direction_score),
+    shape = 16
+  ) +
+  geom_point(
+    data = top_genes_dt[
+      epigenetic_class_fine == "Non-epigenetic" &
+        feature %chin% top_genes_per_class[["Non-epigenetic"]]
+    ],
+    aes(size = percentage_de, color = direction_score),
+    shape = 16
+  ) +
+  geom_point(
+    data = top_genes_dt[
+      epigenetic_class_fine == "PAHi" & feature %chin% top_genes_per_class[["PAHi"]]
+    ],
+    aes(size = percentage_de, color = direction_score),
+    shape = 16
+  ) +
+  scale_color_gradient2(
+    low = "#313695",
+    mid = "#e0f3f8",
+    high = "#a50026",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  scale_size_continuous(
+    limits = c(0, 100),
+    range = c(1, 8),
+    breaks = c(0, 25, 50, 75, 100),
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "black", size = 22),
+    axis.text.x = element_text(angle = 45, size = 12, hjust = 1, vjust = 1, color = "black"),
+    axis.text.y = element_text(color = "black", size = 12),
+    panel.grid.major = element_line(color = "grey95"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    legend.position = "right",
+    legend.box = "vertical"
+  ) +
+  labs(
+    title = "Protein Coding Genes",
+    x = NULL,
+    y = NULL,
+    color = "Direction Score",
+    size = "Percentage DE"
+  ) +
+  coord_fixed(ratio = 0.90)
+```
+
+Create the same plot for TEs
+
+```{r}
+p2 <- ggplot(top_tes_dt, aes(x = feature, y = epigenetic_class_fine)) +
+  geom_point(aes(size = percentage_de, color = direction_score), shape = 1) +
+  geom_point(
+    data = top_tes_dt[
+      epigenetic_class_fine == "CDKi" & feature %chin% top_tes_per_class[["CDKi"]]
+    ],
+    aes(size = percentage_de, color = direction_score),
+    shape = 16
+  ) +
+  geom_point(
+    data = top_tes_dt[
+      epigenetic_class_fine == "DNMTi" & feature %chin% top_tes_per_class[["DNMTi"]]
+    ],
+    aes(size = percentage_de, color = direction_score),
+    shape = 16
+  ) +
+  geom_point(
+    data = top_tes_dt[
+      epigenetic_class_fine == "HDACi" & feature %chin% top_tes_per_class[["HDACi"]]
+    ],
+    aes(size = percentage_de, color = direction_score),
+    shape = 16
+  ) +
+  geom_point(
+    data = top_tes_dt[
+      epigenetic_class_fine == "HDMi" & feature %chin% top_tes_per_class[["HDMi"]]
+    ],
+    aes(size = percentage_de, color = direction_score),
+    shape = 16
+  ) +
+  geom_point(
+    data = top_tes_dt[
+      epigenetic_class_fine == "HMTi" & feature %chin% top_tes_per_class[["HMTi"]]
+    ],
+    aes(size = percentage_de, color = direction_score),
+    shape = 16
+  ) +
+  geom_point(
+    data = top_tes_dt[
+      epigenetic_class_fine == "Non-epigenetic" &
+        feature %chin% top_tes_per_class[["Non-epigenetic"]]
+    ],
+    aes(size = percentage_de, color = direction_score),
+    shape = 16
+  ) +
+  geom_point(
+    data = top_tes_dt[
+      epigenetic_class_fine == "PAHi" & feature %chin% top_tes_per_class[["PAHi"]]
+    ],
+    aes(size = percentage_de, color = direction_score),
+    shape = 16
+  ) +
+  scale_color_gradient2(
+    low = "#313695",
+    mid = "#e0f3f8",
+    high = "#a50026",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  scale_size_continuous(
+    limits = c(0, 100),
+    range = c(1, 8),
+    breaks = c(0, 25, 50, 75, 100),
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "black", size = 22),
+    axis.text.x = element_text(angle = 45, size = 12, hjust = 1, vjust = 1, color = "black"),
+    axis.text.y = element_text(color = "black", size = 12),
+    panel.grid.major = element_line(color = "grey95"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    legend.position = "right",
+    legend.box = "vertical"
+  ) +
+  labs(
+    title = "TE Subfamilies",
+    x = NULL,
+    y = NULL,
+    color = "Direction Score",
+    size = "Percentage DE"
+  ) +
+  coord_fixed(ratio = 0.9)
+```
+
+```{r}
+(p1 / p2) + plot_layout(guides = "collect")
+ggsave(here(figures, "top-features.png"), width = 18, height = 12, dpi = 600)
+ggsave(here(figures, "top-features.pdf"), width = 18, height = 12)
+```
+
