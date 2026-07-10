@@ -37,7 +37,7 @@ opt_parser <- OptionParser(option_list = option_list)
 opt <- parse_args(opt_parser)
 
 message("Reading in annotation files for processing steps...")
-tx2gene <- readRDS("/mnt/data/gdata/human/REdiscoverTE_hg38/tx2gene_REdiscoverTE.rds")
+tx2gene <- readRDS("resources/REdiscoverTE_hg38/tx2gene_REdiscoverTE.rds")
 
 message("Creating count matrices from quant files...")
 quant_files <- list.files(
