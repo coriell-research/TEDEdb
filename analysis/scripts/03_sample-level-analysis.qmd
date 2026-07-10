@@ -405,12 +405,21 @@ getControls <- function(x) {
 
       return(controls)
     },
-    error = function(e) return(NULL)
+    error = function(e) {
+      print("Something went wrong. Returning NULL value", e)
+      return(NULL)
+    }
   )
 }
 
-controls <- parallel::mclapply(result_sefiles, getControls, mc.cores = 32)
-controls <- unlist(controls)
+control_file <- here(rdsfiles, "controls.rds")
+if (!(file.exists(control_file))) {
+  controls <- lapply(result_sefiles, getControls)
+  controls <- unlist(controls)
+  saveRDS(controls, control_file)
+} else {
+  controls <- readRDS(control_file)
+}
 ```
 
 ### Filter the se object for control samples only
@@ -465,16 +474,16 @@ getContrastMapping <- function(x) {
 
   setorder(result, BioSample)
 }
-```
 
-```{r}
-contrast_map <- parallel::mclapply(
-  result_sefiles,
-  getContrastMapping,
-  mc.cores = 32
-)
-contrast_map <- rbindlist(contrast_map, idcol = "BioProject")
-contrast_map[, id := paste(BioProject, contrast, sep = ".")]
+contrast_map_file <- here(rdsfiles, "contrast-map.rds")
+if (!file.exists(contrast_map_file)) {
+  contrast_map <- lapply(result_sefiles, getContrastMapping)
+  contrast_map <- rbindlist(contrast_map, idcol = "BioProject")
+  contrast_map[, id := paste(BioProject, contrast, sep = ".")]
+  saveRDS(contrast_map, contrast_map_file)
+} else {
+  contrast_map <- readRDS(contrast_map_file)
+}
 ```
 
 ## Get the contrast metadata and map information onto BioSamples
@@ -851,4 +860,78 @@ p_tes <- permanova_tes$`Pr(>F)`[1]
 
 cat("TE Expression PERMANOVA:\n")
 cat("R-squared:", round(r2_tes, 4), "| p-value:", p_tes, "\n")
+```
+
+## Estimate the DSC values
+
+Compute confidence intervals around the dispersion separability criteria value for both datasets 
+from: https://bioinformatics.mdanderson.org/public-software/tcga-batch-effects/
+
+```{r}
+bootstrap_dsc <- function(x, g, B = 100, conf = 0.95) {
+  x <- as.matrix(x)
+  g <- as.factor(g)
+  observed_dsc <- coriell::dsc(x, g)
+
+  boot_dsc_values <- numeric(B)
+  indices <- seq_len(ncol(x))
+
+  strata <- split(indices, g)
+
+  for (i in seq_len(B)) {
+    boot_indices <- unlist(lapply(strata, function(idx) {
+      sample(idx, size = length(idx), replace = TRUE)
+    }))
+
+    x_boot <- x[, boot_indices, drop = FALSE]
+    g_boot <- g[boot_indices]
+
+    boot_dsc_values[i] <- coriell::dsc(x_boot, g_boot)
+  }
+
+  alpha <- 1 - conf
+  lower_prob <- alpha / 2
+  upper_prob <- 1 - (alpha / 2)
+
+  ci <- quantile(boot_dsc_values, probs = c(lower_prob, upper_prob), na.rm = TRUE)
+
+  return(list(
+    observed = observed_dsc,
+    conf_int = ci,
+    bootstrap_values = boot_dsc_values
+  ))
+}
+
+dsc.b <- bootstrap_dsc(lcpms, y$samples$BioProject)
+dsc.genes.b <- bootstrap_dsc(lcpms[rownames(lcpms) %chin% coding, ], y$samples$BioProject)
+dsc.tes.b <- bootstrap_dsc(lcpms[!(rownames(lcpms) %chin% coding), ], y$samples$BioProject)
+```
+
+Evaluate significance
+
+```{r}
+permutation_test_dsc <- function(x, g, n_perms = 1000) {
+  observed_dsc <- coriell::dsc(x, g)
+  null_dsc_values <- numeric(n_perms)
+
+  for (i in seq_len(n_perms)) {
+    g_permuted <- sample(g)
+    null_dsc_values[i] <- coriell::dsc(x, g_permuted)
+  }
+
+  p_value <- (sum(null_dsc_values >= observed_dsc) + 1) / (n_perms + 1)
+
+  return(list(
+    observed = observed_dsc,
+    p_value = p_value,
+    null_distribution = null_dsc_values
+  ))
+}
+
+dsc.perm <- permutation_test_dsc(lcpms, y$samples$BioProject)
+dsc.genes.perm <- permutation_test_dsc(lcpms[rownames(lcpms) %chin% coding, ], y$samples$BioProject)
+dsc.tes.perm <- permutation_test_dsc(
+  lcpms[!(rownames(lcpms) %chin% coding), ],
+  y$samples$BioProject
+)
 ```
