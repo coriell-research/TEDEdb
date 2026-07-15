@@ -5,7 +5,7 @@ extract_de <- function(fpath) {
 
 
 col2assay <- function(df, rows, cols, vals) {
-  m <- dcast(df, get(rows) ~ get(cols), value.var = vals, fill = NA)
+  m <- data.table::dcast(df, get(rows) ~ get(cols), value.var = vals, fill = NA)
   as.matrix(m, rownames = "rows")
 }
 
