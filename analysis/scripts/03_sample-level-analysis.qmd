@@ -11,6 +11,7 @@ suppressPackageStartupMessages(library(here))
 suppressPackageStartupMessages(library(data.table))
 suppressPackageStartupMessages(library(ggplot2))
 suppressPackageStartupMessages(library(edgeR))
+suppressPackageStartupMessages(library(Hmisc))
 suppressPackageStartupMessages(library(SummarizedExperiment))
 suppressPackageStartupMessages(library(patchwork))
 suppressPackageStartupMessages(library(paletteer))
@@ -346,10 +347,6 @@ names(result_sefiles) <- regmatches(
 I will need separate functions for designs with intercepts vs designs without.
 
 ```{r}
-# Test cases with and without intercepts
-test_wi <- metadata(readRDS(result_sefiles[[6]]))$fit
-test_wo <- metadata(readRDS(result_sefiles[["PRJNA318019"]]))$fit
-
 # Extract the BioSample IDs for controls samples with a no intercept design
 getControlsWithoutIntercept <- function(x) {
   cons <- colnames(x$contrasts)
@@ -371,9 +368,6 @@ getControlsWithoutIntercept <- function(x) {
   return(control_samples)
 }
 
-# Test case
-getControlsWithoutIntercept(test_wo)
-
 # Extract the BioSample IDs for controls with intercept models
 getControlsWithIntercept <- function(x) {
   cons <- colnames(x$contrasts)
@@ -383,9 +377,6 @@ getControlsWithIntercept <- function(x) {
 
   return(control_samples)
 }
-
-# Test case
-getControlsWithIntercept(test_wi)
 ```
 
 Extract BioSample IDs of control samples.
@@ -551,6 +542,58 @@ se <- se[, se$oncotree_lineage != ""]
 se <- se[, se$ccle_name != ""]
 ```
 
+### Incorporate run-info
+
+Incorporate information from the run-info files that was not imported into the db object. For 
+example, information about RNA capture method or length of sequenced fragments. Note, run-info also
+contains samples from the same experiment that were not neccesarily RNA-seq. 
+
+```{r}
+run_files <- list.files(
+  path = "bioprojects",
+  pattern = "run-info.csv",
+  recursive = TRUE,
+  full.names = TRUE
+)
+names(run_files) <- regmatches(run_files, regexpr("PRJNA[0-9]+", run_files))
+
+keep_cols <- c(
+  "BioSample" = "character",
+  "avgLength" = "integer",
+  "LibraryStrategy" = "character",
+  "LibrarySelection" = "character",
+  "LibrarySource" = "character",
+  "LibraryLayout" = "character",
+  "Platform" = "character",
+  "Model" = "character"
+)
+
+run_info <- rbindlist(lapply(run_files, fread, select = keep_cols), idcol = "BioProject")
+
+# Only keep BioSample information,  runs will be duplicated for some
+run_info <- unique(run_info)
+```
+
+Add this information back to the se object
+
+```{r}
+idx <- match(se$BioSample, run_info$BioSample)
+
+se$avgLength <- run_info[idx, ]$avgLength
+se$LibraryStrategy <- run_info[idx, ]$LibraryStrategy
+se$LibrarySelection <- run_info[idx, ]$LibrarySelection
+se$LibrarySource <- run_info[idx, ]$LibrarySource
+se$LibraryLayout <- run_info[idx, ]$LibraryLayout
+se$Platform <- run_info[idx, ]$Platform
+se$Model <- run_info[idx, ]$Model
+```
+
+Quick summary of all variables
+
+```{r}
+desc <- describe(data.frame(colData(se)))
+```
+
 ## Dimensionality Reduction on the TEDEdb control samples
 
 ### Filter for expression
@@ -559,7 +602,7 @@ First, keep only genes and 'main' TE families
 
 ```{r}
 gtf_gr <- readRDS(
-  "/mnt/data/gdata/human/REdiscoverTE_hg38/gencode.v26.annotation.gtf.rds"
+  "resources/REdiscoverTE_hg38/gencode.v26.annotation.gtf.rds"
 )
 coding <- gtf_gr[gtf_gr$type == "gene" & gtf_gr$gene_type == "protein_coding", ]
 coding <- unique(coding$gene_name)
@@ -770,6 +813,35 @@ legend(
 dev.off()
 ```
 
+Color by library layouts
+
+```{r}
+lay_pal <- c("#FCBBA1", "#EF3B2C", "#67000D", "#C6DBEF", "#4292C6", "#08306B")
+names(lay_pal) <- c('ISF', 'ISR', 'IU', 'SF', 'SR', 'U')
+
+pdf(here(figures, "umap_libtypes.pdf"), width = 18, height = 6)
+par(mfrow = c(1, 3))
+plotUmap(udata.genes, "library_types", lay_pal, "Protein Coding Genes")
+plotUmap(udata.tes, "library_types", lay_pal, "TEs")
+
+# Add legend as new plot area
+plot.new()
+plot.window(xlim = c(0, 0.5), ylim = c(1, 10))
+legend(
+  0,
+  10,
+  legend = names(lay_pal),
+  col = lay_pal,
+  pch = 19,
+  bty = "n",
+  cex = 1,
+  title = "Library Types",
+  title.font = 2,
+  title.adj = 0
+)
+dev.off()
+```
+
 ## Create highlight images to see what the trends are per lineage
 
 ```{r}
@@ -844,11 +916,7 @@ permanova_tes <- vegan::adonis2(
   permutations = 1e3,
   parallel = 48
 )
-```
 
-Extract and show stats
-
-```{r}
 r2_genes <- permanova_genes$R2[1]
 p_genes <- permanova_genes$`Pr(>F)`[1]
 
@@ -860,6 +928,40 @@ p_tes <- permanova_tes$`Pr(>F)`[1]
 
 cat("TE Expression PERMANOVA:\n")
 cat("R-squared:", round(r2_tes, 4), "| p-value:", p_tes, "\n")
+```
+
+### Evaluate the same thing but instead use the library_type as a covariate
+
+```{r}
+set.seed(123)
+
+LibType <- pca.genes$metadata$library_types
+
+permanova_genes2 <- vegan::adonis2(
+  d_genes ~ LibType + BioProject,
+  by = "terms",
+  permutations = 1e3,
+  parallel = 48
+)
+
+permanova_tes2 <- vegan::adonis2(
+  d_tes ~ LibType + BioProject,
+  by = "terms",
+  permutations = 1e3,
+  parallel = 48
+)
+
+r2_genes2 <- permanova_genes2$R2[1]
+p_genes2 <- permanova_genes2$`Pr(>F)`[1]
+
+cat("Gene Expression PERMANOVA:\n")
+cat("R-squared:", round(r2_genes2, 4), "| p-value:", p_genes2, "\n\n")
+
+r2_tes2 <- permanova_tes2$R2[1]
+p_tes2 <- permanova_tes2$`Pr(>F)`[1]
+
+cat("TE Expression PERMANOVA:\n")
+cat("R-squared:", round(r2_tes2, 4), "| p-value:", p_tes2, "\n")
 ```
 
 ## Estimate the DSC values
