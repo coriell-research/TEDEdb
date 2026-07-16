@@ -566,6 +566,10 @@ plot_gene_volcano <- function(x, ...) {
     x_axis_limits = c(-5, 5),
     y_axis_limits = c(0, 300),
     lab_digits = 0,
+    ,
+    up_shape = 16,
+    up_size = 1,
+    down_size = 1,
     ...
   ) +
     labs(
@@ -590,7 +594,9 @@ plot_te_volcano <- function(x, ...) {
     y_axis_limits = c(0, 40),
     lab_digits = 0,
     up_color = "red2",
-    up_shape = 1,
+    up_shape = 16,
+    up_size = 1,
+    down_size = 1,
     ...
   ) +
     geom_point(
@@ -598,8 +604,9 @@ plot_te_volcano <- function(x, ...) {
         Feature %like% "^LTR.ERV" & Meta.logFC > log2(1.5) & Meta.FDR < 0.1
       ],
       aes(x = Meta.logFC, y = -log10(Meta.FDR)),
-      color = "red2",
-      shape = 16
+      color = "purple",
+      shape = 16,
+      size = 1.2
     ) +
     labs(
       title = x,
@@ -638,7 +645,7 @@ ggsave(here(figures, "meta-te-volcano.pdf"), width = 11, height = 9)
 
 ```{r}
 (erv_counts <- meta_results_dt[
-  Meta.FDR < 0.05 &
+  Meta.FDR < 0.1 &
     Meta.logFC > log2(1.5) &
     Feature %like% "^LTR.ERV" &
     treatment %chin% c("Decitabine", "Etoposide", "Doxorubicin", "JQ1"),
@@ -653,10 +660,10 @@ ggsave(here(figures, "meta-te-volcano.pdf"), width = 11, height = 9)
 keep_trt <- c("Decitabine", "Doxorubicin", "Etoposide", "JQ1")
 
 up_meta <- meta_results_dt[
-  Meta.FDR < 0.05 & Meta.logFC > log2(1.5) & treatment %chin% keep_trt
+  Meta.FDR < 0.1 & Meta.logFC > log2(1.5) & treatment %chin% keep_trt
 ]
 down_meta <- meta_results_dt[
-  Meta.FDR < 0.05 & Meta.logFC < -log2(1.5) & treatment %chin% keep_trt
+  Meta.FDR < 0.1 & Meta.logFC < -log2(1.5) & treatment %chin% keep_trt
 ]
 
 up_meta <- split(up_meta, by = "treatment")
