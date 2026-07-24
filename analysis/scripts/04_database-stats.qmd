@@ -9,6 +9,7 @@ format: html
 ```{r}
 suppressPackageStartupMessages(library(here))
 suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(tinyplot))
 suppressPackageStartupMessages(library(ggplot2))
 suppressPackageStartupMessages(library(SummarizedExperiment))
 suppressPackageStartupMessages(library(patchwork))
@@ -310,6 +311,91 @@ ColourTernary(
 )
 
 dev.off()
+```
+
+### Show as barplots instead of ternary plot
+
+the ternary plots can be confusing.
+
+```{r}
+gene_stats.w[, `:=`(
+  prop_up_cat = Hmisc::cut2(prop_up, cuts = c(0, 0.05, 0.1, 0.5, 1.0)),
+  prop_down_cat = Hmisc::cut2(prop_down, cuts = c(0, 0.05, 0.1, 0.5, 1.0))
+)]
+
+te_stats.w[, `:=`(
+  prop_up_cat = Hmisc::cut2(prop_up, cuts = c(0, 0.05, 0.1, 0.5, 1.0)),
+  prop_down_cat = Hmisc::cut2(prop_down, cuts = c(0, 0.05, 0.1, 0.5, 1.0))
+)]
+
+# Tally the contrasts in each category
+gene_cats <- melt(gene_stats.w, id.vars = "id", measure.vars = c("prop_up_cat", "prop_down_cat"))
+te_cats <- melt(te_stats.w, id.vars = "id", measure.vars = c("prop_up_cat", "prop_down_cat"))
+
+gene_cats <- gene_cats[, .N, by = .(variable, value)]
+te_cats <- te_cats[, .N, by = .(variable, value)]
+
+# Relabel the categories or plotting
+gene_cats[,
+  percentage := fcase(
+    value == "[0.00,0.05)" , "[0-5%)"    ,
+    value == "[0.05,0.10)" , "[5-10%)"   ,
+    value == "[0.10,0.50)" , "[10-50%)"  ,
+    value == "[0.50,1.00]" , "[50-100%]"
+  )
+]
+
+te_cats[,
+  percentage := fcase(
+    value == "[0.00,0.05)" , "[0-5%)"    ,
+    value == "[0.05,0.10)" , "[5-10%)"   ,
+    value == "[0.10,0.50)" , "[10-50%)"  ,
+    value == "[0.50,1.00]" , "[50-100%]"
+  )
+]
+
+gene_cats[,
+  percentage := factor(percentage, levels = c("[0-5%)", "[5-10%)", "[10-50%)", "[50-100%]"))
+]
+te_cats[,
+  percentage := factor(percentage, levels = c("[0-5%)", "[5-10%)", "[10-50%)", "[50-100%]"))
+]
+```
+
+```{r}
+tinytheme("clean", cex.main = 2, cex.lab = 1.5, cex.axis = 1.2)
+
+tinyplot(
+  N ~ percentage | variable,
+  data = gene_cats,
+  type = type_barplot(beside = TRUE, drop.zeros = TRUE, width = 0.65),
+  ylim = c(0, 1500),
+  main = "Protein Coding Genes",
+  xlab = "Percentage Dysregulation",
+  ylab = "Number of Contrasts",
+  pal = c("red2", "blue2"),
+  legend = list("top", title = "", legend = c("Upregulated", "Downregulated"), cex = 1.5),
+  file = here(figures, "gene-dysregulation-contrast-counts.pdf"),
+  width = 9,
+  height = 6,
+  units = "cm"
+)
+
+tinyplot(
+  N ~ percentage | variable,
+  data = te_cats,
+  type = type_barplot(beside = TRUE, drop.zeros = TRUE, width = 0.65),
+  ylim = c(0, 1500),
+  main = "Transposable Element Subfamilies",
+  xlab = "Percentage Dysregulation",
+  ylab = "Number of Contrasts",
+  pal = c("red2", "blue2"),
+  legend = list("top", title = "", legend = c("Upregulated", "Downregulated"), cex = 1.5),
+  file = here(figures, "te-dysregulation-contrast-counts.pdf"),
+  width = 9,
+  height = 6,
+  units = "cm"
+)
 ```
 
 ## Dysregulation by epigenetic class
