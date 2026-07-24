@@ -285,8 +285,7 @@ te_jack_stats <- rbindlist(te_jack_stats, idcol = "Compound")
 
 JP wanted to know some kind of 'baseline' expectation for how many genes are expected to be 
 dysregulated in a given meta-analysis. He suggested permuting the genes and re-computing the 
-meta-analysis. My expectation is that this will yield hardly any DE results and will not serve as a 
-more useful assesment of stability than the jackknife.
+meta-analysis. 
 
 First, create a funtion that will shuffle the entries in each column of the given se object, keeping 
 each column self-contained (so all results from a single experiment are shuffled) but synchronized 
@@ -561,15 +560,15 @@ plot_gene_volcano <- function(x, ...) {
     y = "Meta.FDR",
     fdr = 0.1,
     lfc = log2(1.5),
-    raster = TRUE,
-    raster_dpi = 600,
+    annotate_counts = FALSE,
     x_axis_limits = c(-5, 5),
     y_axis_limits = c(0, 300),
     lab_digits = 0,
-    ,
     up_shape = 16,
     up_size = 1,
     down_size = 1,
+    raster = TRUE,
+    raster_dpi = 600,
     ...
   ) +
     labs(
@@ -578,6 +577,10 @@ plot_gene_volcano <- function(x, ...) {
       x = "Meta logFC",
       y = "-log10(Meta FDR)",
       caption = NULL
+    ) +
+    theme(
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA)
     )
 }
 
@@ -588,8 +591,7 @@ plot_te_volcano <- function(x, ...) {
     y = "Meta.FDR",
     fdr = 0.1,
     lfc = log2(1.5),
-    raster = TRUE,
-    raster_dpi = 600,
+    annotate_counts = FALSE,
     x_axis_limits = c(-2, 2),
     y_axis_limits = c(0, 40),
     lab_digits = 0,
@@ -597,6 +599,8 @@ plot_te_volcano <- function(x, ...) {
     up_shape = 16,
     up_size = 1,
     down_size = 1,
+    raster = TRUE,
+    raster_dpi = 600,
     ...
   ) +
     geom_point(
@@ -614,6 +618,10 @@ plot_te_volcano <- function(x, ...) {
       x = "Meta logFC",
       y = "-log10(Meta FDR)",
       caption = NULL
+    ) +
+    theme(
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA)
     )
 }
 ```
