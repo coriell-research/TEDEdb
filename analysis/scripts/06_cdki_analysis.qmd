@@ -1,0 +1,243 @@
+---
+title: Meta-analysis of CDKis
+author: Gennaro Calendo
+format: html
+---
+
+Reviewers were curious about specific CDKis (rightly so). Perform meta-analysis of separate CDKis. 
+Connecting to the database and filtering contrasts is the same as in the previous analysis. 
+
+## Set up
+
+```{r}
+suppressPackageStartupMessages(library(here))
+suppressPackageStartupMessages(library(coriell))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(SummarizedExperiment))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(patchwork))
+
+datafiles <- here("analysis", "results", "data-files", "06")
+figures <- here("analysis", "results", "figures", "06")
+rdsfiles <- here("analysis", "results", "rds-files", "06")
+
+invisible(sapply(c(datafiles, figures, rdsfiles), dir.create, showWarnings = F))
+```
+
+## Connect to TEDEdb
+
+```{r}
+db <- HDF5Array::loadHDF5SummarizedExperiment(
+  "/mnt/data/data_gc/TEDEdb/appdata/se_hdf5"
+)
+```
+
+## Filter contrasts
+
+- Remove any contrasts from primary cells or multiple cell lines combined
+- Remove any contrasts from non-cancer cell lines
+- Remove any contrasts containing samples flagged as outliers
+
+```{r}
+db <- db[, !db$cell_line %like% "^PRIMARY|^MULTIPLE"]
+db <- db[,
+  db$oncotree_primary_disease != "Non-Cancerous" &
+    !is.na(db$oncotree_primary_disease)
+]
+db <- db[, db$outlier_flags == "None"]
+```
+
+## Collect the CDKi contrasts
+
+```{r}
+cdkis <- subset(colData(db), mechanism_of_action %like% "cdk inhibitor")
+cdkis <- setDT(data.frame(cdkis))
+cdkis_by_trt <- split(cdkis, by = "treatment")
+```
+
+I would only like to keep single agent treatments with more than 2 contrasts present
+
+```{r}
+cdki_counts <- sapply(cdkis_by_trt, nrow)
+cdki_counts <- cdki_counts[!names(cdki_counts) %flike% "+"]
+cdki_counts <- sort(cdki_counts[cdki_counts > 2], decreasing = TRUE)
+
+trts <- names(cdki_counts)
+```
+
+What are the stats associated with these treatments?
+
+```{r}
+for (trt in trts) {
+  df <- colData(db)[db$treatment == trt, ]
+  msg <- paste0(
+    trt,
+    " - ",
+    "Contrasts: ",
+    nrow(df),
+    "; ",
+    "BioProjects: ",
+    length(unique(df$experiment)),
+    "; ",
+    "Cell Lines: ",
+    length(unique(df$cell_line)),
+    "; ",
+    "Lineages: ",
+    length(unique(df$oncotree_lineage)),
+    "\n"
+  )
+  cat(msg)
+}
+```
+
+## Perform meta-analysis on these data
+
+```{r}
+meta_results <- parallel::mclapply(
+  trts,
+  function(x) {
+    se <- db[, db$treatment == x]
+    result <- meta_de(
+      se,
+      FUN = metapod::parallelFisher,
+      pval = "P.Value",
+      se = "SE"
+    )
+    result <- result[!is.na(Meta.Pval)]
+    result[, Meta.FDR := p.adjust(Meta.Pval, method = "BH")]
+    return(result)
+  },
+  mc.cores = 8
+)
+names(meta_results) <- trts
+
+# Save results to file
+meta_results_dt <- rbindlist(meta_results, idcol = "treatment")
+fwrite(
+  meta_results_dt,
+  here(datafiles, "cdki-meta-analysis-results.tsv"),
+  sep = "\t"
+)
+```
+
+## Plot the results of each meta-analysis
+
+
+```{r}
+plot_gene_volcano <- function(x, ...) {
+  coriell::plot_volcano(
+    meta_results[[x]][!Feature %like% ".*\\..*\\..*"],
+    x = "Meta.logFC",
+    y = "Meta.FDR",
+    fdr = 0.1,
+    lfc = log2(1.5),
+    annotate_counts = TRUE,
+    x_axis_limits = c(-5, 5),
+    lab_digits = 0,
+    up_shape = 16,
+    up_size = 1,
+    down_size = 1,
+    raster = TRUE,
+    raster_dpi = 600,
+    ...
+  ) +
+    labs(
+      title = x,
+      subtitle = "Protein Coding Genes",
+      x = "Meta logFC",
+      y = "-log10(Meta FDR)",
+      caption = NULL
+    ) +
+    theme(
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA)
+    )
+}
+
+plot_te_volcano <- function(x, ...) {
+  coriell::plot_volcano(
+    meta_results[[x]][Feature %like% ".*\\..*\\..*"],
+    x = "Meta.logFC",
+    y = "Meta.FDR",
+    fdr = 0.1,
+    lfc = log2(1.5),
+    annotate_counts = TRUE,
+    x_axis_limits = c(-2, 2),
+    lab_digits = 0,
+    up_color = "red2",
+    up_shape = 16,
+    up_size = 1,
+    down_size = 1,
+    raster = TRUE,
+    raster_dpi = 600,
+    ...
+  ) +
+    geom_point(
+      data = meta_results[[x]][
+        Feature %like% "Alu" & Meta.logFC > log2(1.5) & Meta.FDR < 0.1
+      ],
+      aes(x = Meta.logFC, y = -log10(Meta.FDR)),
+      color = "purple",
+      shape = 16,
+      size = 1.2
+    ) +
+    labs(
+      title = x,
+      subtitle = "TE Subfamilies",
+      x = "Meta logFC",
+      y = "-log10(Meta FDR)",
+      caption = NULL
+    ) +
+    theme(
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA)
+    )
+}
+```
+
+Organize plots. It seems that the Alu dysregulation is mostly driven by the THZ compounds. This is
+interesting. Could be intron retention / lack of splicing from broken elogation mechanisms. Would 
+need library strtategy information and genomic alignments to disentangle this. 
+
+```{r}
+# Reorder plots
+o <- c("THZ531", "THZ1", "HH1", "Alvocidib", "OTS964", "Palbociclib", "Abemaciclib", "Ribociclib")
+
+gene_plots <- lapply(trts, plot_gene_volcano)
+names(gene_plots) <- trts
+gene_plots <- gene_plots[o]
+
+te_plots <- lapply(trts, plot_te_volcano)
+names(te_plots) <- trts
+te_plots <- te_plots[o]
+
+# Add metadata to subtitles - from above
+subtitles <- c(
+  "OTS964" = "Contrasts: 40; BioProjects: 1;\nCell Lines: 5; Lineages: 4",
+  "THZ1" = "Contrasts: 16; BioProjects: 4;\nCell Lines: 7; Lineages: 3",
+  "Palbociclib" = "Contrasts: 8; BioProjects: 3;\nCell Lines: 7; Lineages: 2",
+  "Abemaciclib" = "Contrasts: 7; BioProjects: 2;\nCell Lines: 7; Lineages: 2",
+  "HH1" = "Contrasts: 6; BioProjects: 1;\nCell Lines: 1; Lineages: 1",
+  "Alvocidib" = "Contrasts: 5; BioProjects: 1;\nCell Lines: 5; Lineages: 1",
+  "Ribociclib" = "Contrasts: 5; BioProjects: 1;\nCell Lines: 5; Lineages: 1",
+  "THZ531" = "Contrasts: 5; BioProjects: 3;\nCell Lines: 4; Lineages: 3"
+)
+subtitles <- subtitles[o]
+
+gene_plots <- Map(\(x, y) x + labs(subtitle = y), x = gene_plots, y = subtitles)
+te_plots <- Map(\(x, y) x + labs(subtitle = y), x = te_plots, y = subtitles)
+```
+
+```{r}
+pdf(here(figures, "meta-gene-volcano.pdf"), width = 22, height = 10, bg = "white")
+wrap_plots(gene_plots, ncol = 4) +
+  plot_annotation(title = "Protein Coding Genes") &
+  theme(plot.title = element_text(size = 18, face = "bold"))
+dev.off()
+
+pdf(here(figures, "meta-te-volcano.pdf"), width = 22, height = 10, bg = "white")
+wrap_plots(te_plots, ncol = 4) +
+  plot_annotation(title = "TE Subfamilies") &
+  theme(plot.title = element_text(size = 18, face = "bold"))
+dev.off()
+```
