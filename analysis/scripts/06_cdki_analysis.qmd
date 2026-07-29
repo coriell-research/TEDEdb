@@ -431,15 +431,20 @@ binary_mat <- t(sapply(targets, function(x) {
 }))
 colnames(binary_mat) <- all_targets
 
-bin_colors <- structure(c("white", "#1F78B4"), names = c("0", "1"))
+# Order the cols by target name
+col_o <- gtools::mixedsort(colnames(binary_mat))
+
+# Keep the same order as in the heatmap
+ht_cols <- colnames(lfc_mat)[column_order(ht)]
+ht_cols <- gsub(" \\(.*", "", ht_cols)
 
 pdf(here(figures, "compound-target-heatmap.pdf"), width = 9, height = 6)
 ht_targets <- Heatmap(
-  binary_mat,
+  binary_mat[ht_cols, col_o],
   name = "Target",
-  col = bin_colors,
+  col = structure(c("white", "#1F78B4"), names = c("0", "1")),
   rect_gp = gpar(col = "grey80", lwd = 1),
-  cluster_rows = TRUE,
+  cluster_rows = FALSE,
   show_row_dend = FALSE,
   cluster_columns = FALSE,
   row_names_side = "left",
@@ -448,5 +453,53 @@ ht_targets <- Heatmap(
   show_heatmap_legend = FALSE
 )
 draw(ht_targets, padding = unit(c(2, 10, 2, 2), "mm"))
+dev.off()
+```
+
+## Would it be useful to show all 63 contrasts data?
+
+```{r}
+# Extract the raw DE data from the database for all contrasts
+raw_m <- assay(db[, db$treatment %chin% trts], "z")
+raw_m <- raw_m[rownames(raw_m) %like% ".*\\..*\\..*", ]
+raw_m <- as.matrix(raw_m)
+raw_m <- raw_m[rowVars(raw_m) > 0, ]
+
+# Remove BioProject IDs from colnames
+colnames(raw_m) <- gsub("PRJNA[0-9]+\\.", "", colnames(raw_m))
+
+# Create the row annotation
+row_anno <- tstrsplit(rownames(raw_m), "\\.")
+te_class <- factor(row_anno[[1]], levels = c("SINE", "LINE", "LTR", "DNA", "Retroposon"))
+
+# Split the columns by treatment
+col_trts <- db[, db$treatment %chin% trts]$treatment
+
+# Create annotations for observed
+cls_pal <- as.character(paletteer::paletteer_d("PNWColors::Bay"))
+names(cls_pal) <- levels(te_class)
+
+pdf(here(figures, "contrast-z-heatmap.pdf"), width = 16, height = 10)
+ht_contrasts <- Heatmap(
+  raw_m,
+  name = "z-score",
+  col = circlize::colorRamp2(c(-3, 0, 3), c("#377EB8", "white", "#E41A1C")),
+  right_annotation = rowAnnotation(Class = te_class, col = list(Class = cls_pal)),
+  row_split = te_class,
+  column_split = col_trts,
+  cluster_rows = TRUE,
+  cluster_row_slices = FALSE,
+  cluster_columns = TRUE,
+  show_row_names = FALSE,
+  row_names_gp = gpar(fontsize = 4),
+  column_names_gp = gpar(fontsize = 10),
+  row_title_rot = 0,
+  row_gap = unit(2, "mm"),
+  border = FALSE,
+  column_names_rot = 45,
+  column_title_gp = gpar(fontsize = 14, fontface = "bold"),
+  column_title_rot = 45
+)
+draw(ht_contrasts, padding = unit(c(20, 40, 20, 20), "mm"))
 dev.off()
 ```
