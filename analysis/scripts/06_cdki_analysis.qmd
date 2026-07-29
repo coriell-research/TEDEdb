@@ -16,6 +16,7 @@ suppressPackageStartupMessages(library(data.table))
 suppressPackageStartupMessages(library(SummarizedExperiment))
 suppressPackageStartupMessages(library(ggplot2))
 suppressPackageStartupMessages(library(patchwork))
+suppressPackageStartupMessages(library(ComplexHeatmap))
 
 datafiles <- here("analysis", "results", "data-files", "06")
 figures <- here("analysis", "results", "figures", "06")
@@ -24,44 +25,115 @@ rdsfiles <- here("analysis", "results", "rds-files", "06")
 invisible(sapply(c(datafiles, figures, rdsfiles), dir.create, showWarnings = F))
 ```
 
-## Connect to TEDEdb
+## Read in the dysregulation frequency data
+
+Show same data from main figure as the first image in a multipanel image exploring CDKis in depth.
+
+```{r}
+freq_results_dt <- fread("analysis/results/data-files/04/dysregulation-frequencies.tsv")
+```
+
+Create a diverging barplot showing the TE on the y-axis and the number of contrasts where the TE is 
+DE on the x-axis, splitting the up-regulated counts (in red) and down-regulated counts (in blue) in 
+the middle. 
+
+```{r}
+cdki_te_freqs <- freq_results_dt[epigenetic_class_fine == "CDKi" & feature %like% "\\."][order(
+  n_de,
+  decreasing = TRUE
+)]
+
+cdki_te_freqs[, n_down := -1 * n_down]
+
+cdki_te_freqs.m <- melt(
+  cdki_te_freqs,
+  id.vars = "feature",
+  measure.vars = c("n_up", "n_down"),
+  variable.name = "direction",
+  value.name = "count"
+)
+cdki_te_freqs.m[, total := sum(abs(count)), by = feature]
+setorder(cdki_te_freqs.m, -total)
+cdki_te_freqs.m[, feature := factor(feature, levels = rev(unique(feature)))]
+```
+
+```{r}
+ggplot(cdki_te_freqs.m[1:50], aes(x = count, y = feature, color = direction)) +
+  geom_segment(
+    aes(x = 0, xend = count, y = feature, yend = feature),
+    linewidth = 0.5
+  ) +
+  geom_point(size = 3) +
+  scale_color_manual(
+    values = c("n_up" = "#E41A1C", "n_down" = "#377EB8"),
+    labels = c("n_up" = "Up-regulated", "n_down" = "Down-regulated")
+  ) +
+  scale_x_continuous(labels = abs, n.breaks = 10, limits = c(-15, 20)) +
+  geom_vline(linetype = 2, xintercept = 0, color = "black", linewidth = 1) +
+  theme_classic(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "bottom",
+    axis.title = element_text(size = 14)
+  ) +
+  labs(
+    x = "Number of CDKi Contrasts Where Feature is Differentially Expressed",
+    y = "Transposable Element Subfamily",
+    color = "Direction of Differential Expression"
+  )
+ggsave(here(figures, "cdki-significant-te-contrast-freqs.pdf"), width = 9, height = 6, bg = "white")
+```
+
+## Connect to TEDEdb and filter contrasts for CDKis
+
+Keep the filtering consistent with the previous analysis.
 
 ```{r}
 db <- HDF5Array::loadHDF5SummarizedExperiment(
   "/mnt/data/data_gc/TEDEdb/appdata/se_hdf5"
 )
-```
 
-## Filter contrasts
+# Remove samples from non-cancer studies
+db <- db[, db$oncotree_primary_disease != "Non-Cancerous" & !is.na(db$oncotree_primary_disease)]
 
-- Remove any contrasts from primary cells or multiple cell lines combined
-- Remove any contrasts from non-cancer cell lines
-- Remove any contrasts containing samples flagged as outliers
+# Remove any samples from primary or multiple cell lines
+db <- db[, !db$cell_line %like% "^PRIMARY|MULTIPLE"]
 
-```{r}
-db <- db[, !db$cell_line %like% "^PRIMARY|^MULTIPLE"]
-db <- db[,
-  db$oncotree_primary_disease != "Non-Cancerous" &
-    !is.na(db$oncotree_primary_disease)
-]
+# Remove non-compound treatments
+drop_mech <- c(
+  "N/A",
+  "small interfering rna",
+  "short hairpin rna",
+  "hyperthermia",
+  "cas9 editing",
+  "control vehicle",
+  "lncrna targeting astin1",
+  "lncrna targeting nkx2",
+  "protac (nonfunctional)",
+  "radiation therapy",
+  "radiation therapy | topoisomerase inhibitor",
+  "sparcle expression",
+  "sparcle expression regulator",
+  "sparcle expression regulator"
+)
+db <- db[, db$clinical_phase != "N/A" & (!db$mechanism_of_action %chin% drop_mech)]
+
+# # Drop any contrasts that have been flagged as having outlier samples
 db <- db[, db$outlier_flags == "None"]
+
+# Also remove 'Compound Kushen Injection' since these are technically combintaions
+db <- db[, !db$treatment %like% 'Compound Kushen Injection']
 ```
 
 ## Collect the CDKi contrasts
 
 ```{r}
-cdkis <- subset(colData(db), mechanism_of_action %like% "cdk inhibitor")
+cdkis <- subset(colData(db), mechanism_of_action == "cdk inhibitor")
 cdkis <- setDT(data.frame(cdkis))
 cdkis_by_trt <- split(cdkis, by = "treatment")
-```
 
-I would only like to keep single agent treatments with more than 2 contrasts present
-
-```{r}
-cdki_counts <- sapply(cdkis_by_trt, nrow)
-cdki_counts <- cdki_counts[!names(cdki_counts) %flike% "+"]
-cdki_counts <- sort(cdki_counts[cdki_counts > 2], decreasing = TRUE)
-
+# How many contrasts in each?
+cdki_counts <- sort(sapply(cdkis_by_trt, nrow), decreasing = TRUE)
 trts <- names(cdki_counts)
 ```
 
@@ -84,6 +156,9 @@ for (trt in trts) {
     "; ",
     "Lineages: ",
     length(unique(df$oncotree_lineage)),
+    "; ",
+    "Targets: ",
+    unique(df$targets),
     "\n"
   )
   cat(msg)
@@ -92,152 +167,286 @@ for (trt in trts) {
 
 ## Perform meta-analysis on these data
 
-```{r}
-meta_results <- parallel::mclapply(
-  trts,
-  function(x) {
-    se <- db[, db$treatment == x]
-    result <- meta_de(
-      se,
-      FUN = metapod::parallelFisher,
-      pval = "P.Value",
-      se = "SE"
-    )
-    result <- result[!is.na(Meta.Pval)]
-    result[, Meta.FDR := p.adjust(Meta.Pval, method = "BH")]
-    return(result)
-  },
-  mc.cores = 8
-)
-names(meta_results) <- trts
-
-# Save results to file
-meta_results_dt <- rbindlist(meta_results, idcol = "treatment")
-fwrite(
-  meta_results_dt,
-  here(datafiles, "cdki-meta-analysis-results.tsv"),
-  sep = "\t"
-)
-```
-
-## Plot the results of each meta-analysis
-
+Some have only one contrast so these are just the input data.
 
 ```{r}
-plot_gene_volcano <- function(x, ...) {
-  coriell::plot_volcano(
-    meta_results[[x]][!Feature %like% ".*\\..*\\..*"],
-    x = "Meta.logFC",
-    y = "Meta.FDR",
-    fdr = 0.1,
-    lfc = log2(1.5),
-    annotate_counts = TRUE,
-    x_axis_limits = c(-5, 5),
-    lab_digits = 0,
-    up_shape = 16,
-    up_size = 1,
-    down_size = 1,
-    raster = TRUE,
-    raster_dpi = 600,
-    ...
-  ) +
-    labs(
-      title = x,
-      subtitle = "Protein Coding Genes",
-      x = "Meta logFC",
-      y = "-log10(Meta FDR)",
-      caption = NULL
-    ) +
-    theme(
-      panel.grid = element_blank(),
-      panel.background = element_rect(fill = "white", colour = NA)
-    )
-}
+meta_results_file <- here(rdsfiles, "cdki-meta-results.rds")
+if (!(file.exists(meta_results_file))) {
+  meta_results <- parallel::mclapply(
+    trts,
+    function(x) {
+      se <- db[, db$treatment == x]
+      result <- meta_de(
+        se,
+        FUN = metapod::parallelFisher,
+        pval = "P.Value",
+        se = "SE"
+      )
+      result <- result[!is.na(Meta.Pval)]
+      result[, Meta.FDR := p.adjust(Meta.Pval, method = "BH")]
+      return(result)
+    },
+    mc.cores = 16
+  )
+  names(meta_results) <- trts
 
-plot_te_volcano <- function(x, ...) {
-  coriell::plot_volcano(
-    meta_results[[x]][Feature %like% ".*\\..*\\..*"],
-    x = "Meta.logFC",
-    y = "Meta.FDR",
-    fdr = 0.1,
-    lfc = log2(1.5),
-    annotate_counts = TRUE,
-    x_axis_limits = c(-2, 2),
-    lab_digits = 0,
-    up_color = "red2",
-    up_shape = 16,
-    up_size = 1,
-    down_size = 1,
-    raster = TRUE,
-    raster_dpi = 600,
-    ...
-  ) +
-    geom_point(
-      data = meta_results[[x]][
-        Feature %like% "Alu" & Meta.logFC > log2(1.5) & Meta.FDR < 0.1
-      ],
-      aes(x = Meta.logFC, y = -log10(Meta.FDR)),
-      color = "purple",
-      shape = 16,
-      size = 1.2
-    ) +
-    labs(
-      title = x,
-      subtitle = "TE Subfamilies",
-      x = "Meta logFC",
-      y = "-log10(Meta FDR)",
-      caption = NULL
-    ) +
-    theme(
-      panel.grid = element_blank(),
-      panel.background = element_rect(fill = "white", colour = NA)
-    )
+  saveRDS(meta_results, meta_results_file)
+} else {
+  meta_results <- readRDS(meta_results_file)
 }
 ```
 
-Organize plots. It seems that the Alu dysregulation is mostly driven by the THZ compounds. This is
-interesting. Could be intron retention / lack of splicing from broken elogation mechanisms. Would 
-need library strtategy information and genomic alignments to disentangle this. 
+Perform Jackknife resampling to assess stability
 
 ```{r}
-# Reorder plots
-o <- c("THZ531", "THZ1", "HH1", "Alvocidib", "OTS964", "Palbociclib", "Abemaciclib", "Ribociclib")
+process_jackknife <- function(treatment, prefix, db, run_flag) {
+  message(sprintf("Running %s jacknife meta-analysis...", treatment))
 
-gene_plots <- lapply(trts, plot_gene_volcano)
-names(gene_plots) <- trts
-gene_plots <- gene_plots[o]
+  metafun <- function(x) {
+    coriell::meta_de(x, metapod::parallelFisher, pval = "P.Value", se = "SE")
+  }
 
-te_plots <- lapply(trts, plot_te_volcano)
-names(te_plots) <- trts
-te_plots <- te_plots[o]
+  res <- jackknifeSE(db[, db$treatment == treatment], FUN = metafun)
+  res <- rbindlist(res, idcol = "Jackknife")
 
-# Add metadata to subtitles - from above
-subtitles <- c(
-  "OTS964" = "Contrasts: 40; BioProjects: 1;\nCell Lines: 5; Lineages: 4",
-  "THZ1" = "Contrasts: 16; BioProjects: 4;\nCell Lines: 7; Lineages: 3",
-  "Palbociclib" = "Contrasts: 8; BioProjects: 3;\nCell Lines: 7; Lineages: 2",
-  "Abemaciclib" = "Contrasts: 7; BioProjects: 2;\nCell Lines: 7; Lineages: 2",
-  "HH1" = "Contrasts: 6; BioProjects: 1;\nCell Lines: 1; Lineages: 1",
-  "Alvocidib" = "Contrasts: 5; BioProjects: 1;\nCell Lines: 5; Lineages: 1",
-  "Ribociclib" = "Contrasts: 5; BioProjects: 1;\nCell Lines: 5; Lineages: 1",
-  "THZ531" = "Contrasts: 5; BioProjects: 3;\nCell Lines: 4; Lineages: 3"
-)
-subtitles <- subtitles[o]
+  res <- res[!is.na(Meta.Pval)]
+  res[, Meta.FDR := p.adjust(Meta.Pval, method = "BH"), by = Jackknife]
 
-gene_plots <- Map(\(x, y) x + labs(subtitle = y), x = gene_plots, y = subtitles)
-te_plots <- Map(\(x, y) x + labs(subtitle = y), x = te_plots, y = subtitles)
+  return(res)
+}
+
+jk_results_file <- here(rdsfiles, "cdki-jackknife-stats.rds")
+if (!(file.exists(jk_results_file))) {
+  jk_results <- lapply(trts, function(x) {
+    process_jackknife(
+      treatment = x,
+      prefix = x,
+      db = db,
+      run_flag = run
+    )
+  })
+  names(jk_results) <- trts
+  saveRDS(jk_results, jk_results_file)
+} else {
+  jk_results <- readRDS(jk_results_file)
+}
 ```
 
+Compute bias around the percentage estimates
+
 ```{r}
-pdf(here(figures, "meta-gene-volcano.pdf"), width = 22, height = 10, bg = "white")
-wrap_plots(gene_plots, ncol = 4) +
-  plot_annotation(title = "Protein Coding Genes") &
-  theme(plot.title = element_text(size = 18, face = "bold"))
+computeJackknifeBias <- function(orig, jacks, n, feature = "genes") {
+  if (feature == "genes") {
+    dt1 <- orig[!Feature %like% ".*\\..*\\..*"]
+    dt2 <- jacks[!Feature %like% ".*\\..*\\..*"]
+  } else {
+    dt1 <- orig[Feature %like% ".*\\..*\\..*"]
+    dt2 <- jacks[Feature %like% ".*\\..*\\..*"]
+  }
+
+  # Get the observed data from the full test
+  summary_stats <- summarize_dge(
+    dt1,
+    fdr = 0.1,
+    lfc = log2(1.5),
+    fdr_col = "Meta.FDR",
+    lfc_col = "Meta.logFC"
+  )
+  setDT(summary_stats)
+  theta_hat_up <- summary_stats[Direction == "Up", Percent]
+  theta_hat_down <- summary_stats[Direction == "Down", Percent]
+
+  # Compute mean percentages across all jackknifes
+  jack_stats <- dt2[,
+    summarize_dge(.SD, fdr = 0.1, lfc = log2(1.5), fdr_col = "Meta.FDR", lfc_col = "Meta.logFC"),
+    by = Jackknife
+  ]
+
+  jack_estimates_up <- jack_stats[Direction == "Up", Percent]
+  jack_estimates_down <- jack_stats[Direction == "Down", Percent]
+  theta_bar_up <- mean(jack_estimates_up)
+  theta_bar_down <- mean(jack_estimates_down)
+
+  # Compute jackknife bias and variance
+  bias_jack_up <- (n - 1) * (theta_bar_up - theta_hat_up)
+  bias_jack_down <- (n - 1) * (theta_bar_down - theta_hat_down)
+
+  var_term_up <- sum((jack_estimates_up - theta_bar_up)^2)
+  var_term_down <- sum((jack_estimates_down - theta_bar_down)^2)
+
+  se_jack_up <- sqrt(((n - 1) / n) * var_term_up)
+  se_jack_down <- sqrt(((n - 1) / n) * var_term_down)
+
+  data.table(
+    Direction = c("Up", "Down"),
+    Observed = c(theta_hat_up, theta_hat_down),
+    Corrected = c(theta_hat_up - bias_jack_up, theta_hat_down - bias_jack_down),
+    Bias = c(bias_jack_up, bias_jack_down),
+    SE = c(se_jack_up, se_jack_down)
+  )
+}
+```
+
+Collect gene and TE percentage bias esstimates for each compund and format for plotting 
+
+```{r}
+# Compute the bias and variance estimates for genes and TEs
+gene_jack_stats <- Map(
+  computeJackknifeBias,
+  orig = meta_results[names(cdki_counts)],
+  jacks = jk_results[names(cdki_counts)],
+  n = cdki_counts
+)
+names(gene_jack_stats) <- paste0(names(gene_jack_stats), " (n=", cdki_counts, ")")
+gene_jack_stats <- rbindlist(gene_jack_stats, idcol = "Compound")
+
+te_jack_stats <- Map(
+  computeJackknifeBias,
+  orig = meta_results[names(cdki_counts)],
+  jacks = jk_results[names(cdki_counts)],
+  n = cdki_counts,
+  feature = "TEs"
+)
+names(te_jack_stats) <- paste0(names(te_jack_stats), " (n=", cdki_counts, ")")
+te_jack_stats <- rbindlist(te_jack_stats, idcol = "Compound")
+
+# Combine both into a single dt for plotting
+jack_stats <- rbindlist(
+  list("Protein Coding Genes" = gene_jack_stats, "TE Subfamilies" = te_jack_stats),
+  idcol = "FeatureType"
+)
+jack_stats[Direction == "Down", Observed := -1 * Observed]
+jack_stats[is.na(Bias), SE := NaN]
+
+# Determine the order on the plot
+lvls <- jack_stats[
+  FeatureType == "Protein Coding Genes" &
+    Direction == "Down"
+][order(Observed, decreasing = TRUE)][,
+  Compound
+]
+jack_stats[, Compound := factor(Compound, levels = lvls)]
+```
+
+Plot the results of the meta-analysis with the SE from the Jackknife estimates
+
+```{r}
+ggplot(jack_stats, aes(x = Compound, y = Observed, fill = Direction)) +
+  geom_col(color = "white") +
+  geom_errorbar(data = jack_stats, aes(ymin = Observed - SE, ymax = Observed + SE), width = 0.2) +
+  facet_wrap(~FeatureType) +
+  scale_fill_manual(
+    values = c("Up" = "#E41A1C", "Down" = "#377EB8"),
+    labels = c("Up" = "Meta Up-regulated", "Down" = "Meta Down-regulated")
+  ) +
+  scale_y_continuous(labels = \(x) paste0(abs(x), "%"), n.breaks = 10, limits = c(-100, 100)) +
+  #geom_hline(linetype = 1, yintercept = 0, color = "black", linewidth = 0.5) +
+  coord_flip() +
+  labs(
+    fill = NULL,
+    y = "Percentage of Meta-Dysregulated Features \u00B1 SE",
+    x = "Compound (Number of Contrasts)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    text = element_text(color = "black"),
+    axis.title = element_text(size = 16),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(linetype = 3, color = "grey80"),
+    strip.text = element_text(size = 14, face = "bold")
+  )
+ggsave(here(figures, "cdki-meta-results-barplot.pdf"), width = 12, height = 6, bg = "white")
+```
+
+## Show meta-lfc values as a heatmap across conditions
+
+Extract meta results as a matrix
+
+```{r}
+meta_results_dt <- rbindlist(meta_results, idcol = "Compound")
+
+# Cast into a matrix for ComplexHeatmap
+lfc_mat <- meta_results_dt[Feature %like% ".*\\..*\\..*"]
+lfc_mat <- dcast(lfc_mat, Feature ~ Compound, value.var = "Meta.logFC")
+lfc_mat <- as.matrix(lfc_mat, rownames = "Feature")
+
+# Limit to TEs observed across all compounds
+lfc_mat <- lfc_mat[!matrixStats::rowAnyNAs(lfc_mat), ]
+
+# Name the columns with the number of contrassts
+colnames(lfc_mat) <- paste0(colnames(lfc_mat), " (n=", cdki_counts[colnames(lfc_mat)], ")")
+```
+
+Generate a heatmap at the meta-compund level showing the TE dysregulation
+
+```{r}
+# Create the row annotation
+row_anno <- tstrsplit(rownames(lfc_mat), "\\.")
+te_class <- factor(row_anno[[1]], levels = c("SINE", "LINE", "LTR", "DNA", "Retroposon"))
+
+# Create annotations for observed
+cls_pal <- as.character(paletteer::paletteer_d("PNWColors::Bay"))
+names(cls_pal) <- levels(te_class)
+
+pdf(here(figures, "meta-te-lfc-heatmap.pdf"), width = 8, height = 10)
+ht <- Heatmap(
+  lfc_mat,
+  name = "Meta logFC",
+  col = circlize::colorRamp2(c(-3, 0, 3), c("#377EB8", "white", "#E41A1C")),
+  right_annotation = rowAnnotation(Class = te_class, col = list(Class = cls_pal)),
+  row_split = te_class,
+  cluster_rows = TRUE,
+  cluster_row_slices = FALSE,
+  cluster_columns = TRUE,
+  show_row_names = FALSE,
+  row_names_gp = gpar(fontsize = 4),
+  column_names_gp = gpar(fontsize = 12),
+  row_title_rot = 0,
+  row_gap = unit(2, "mm"),
+  border = FALSE,
+  column_names_rot = 45,
+  column_title_gp = gpar(fontsize = 14, fontface = "bold")
+)
+draw(ht, padding = unit(c(20, 2, 2, 2), "mm"))
 dev.off()
+```
 
-pdf(here(figures, "meta-te-volcano.pdf"), width = 22, height = 10, bg = "white")
-wrap_plots(te_plots, ncol = 4) +
-  plot_annotation(title = "TE Subfamilies") &
-  theme(plot.title = element_text(size = 18, face = "bold"))
+## Explore overlapping targets for each compound
+
+```{r}
+targets <- lapply(trts, function(x) {
+  df <- colData(db)[db$treatment == x, ]
+  unique(df$targets)
+})
+names(targets) <- trts
+
+targets <- lapply(targets, \(x) strsplit(x, " | ", fixed = TRUE)[[1]])
+
+all_targets <- sort(unique(unlist(targets)))
+
+binary_mat <- t(sapply(targets, function(x) {
+  as.integer(all_targets %in% x)
+}))
+colnames(binary_mat) <- all_targets
+
+bin_colors <- structure(c("white", "#1F78B4"), names = c("0", "1"))
+
+pdf(here(figures, "compound-target-heatmap.pdf"), width = 9, height = 6)
+ht_targets <- Heatmap(
+  binary_mat,
+  name = "Target",
+  col = bin_colors,
+  rect_gp = gpar(col = "grey80", lwd = 1),
+  cluster_rows = TRUE,
+  show_row_dend = FALSE,
+  cluster_columns = FALSE,
+  row_names_side = "left",
+  column_names_rot = 45,
+  column_title = "Compound CDK Targets from Broad Repurposing Hub",
+  show_heatmap_legend = FALSE
+)
+draw(ht_targets, padding = unit(c(2, 10, 2, 2), "mm"))
 dev.off()
 ```
