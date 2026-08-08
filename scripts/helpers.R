@@ -3,7 +3,6 @@ extract_de <- function(fpath) {
   metadata(se)[["de"]]
 }
 
-
 col2assay <- function(df, rows, cols, vals) {
   m <- data.table::dcast(df, get(rows) ~ get(cols), value.var = vals, fill = NA)
   as.matrix(m, rownames = "rows")
@@ -18,6 +17,7 @@ getSampleMetadata <- function(x) {
 }
 
 
+# Extrcat the contrast matrix from each result SE and coerce to a data.table with group member indicators
 getContrasts <- function(x) {
   se <- readRDS(x)
   cm <- S4Vectors::metadata(se)$fit$contrasts
@@ -35,9 +35,9 @@ getContrasts <- function(x) {
 }
 
 
+# Return IDs where BioSamples have been flagged as an outlier
 getOutlierContrasts <- function(sefiles, cores) {
   # Sample-level metadata with Salmon meta_info
-  message("Reading in sample-level metadata...")
   metadata <- data.table::rbindlist(
     parallel::mclapply(sefiles, getSampleMetadata, mc.cores = cores),
     fill = TRUE,
@@ -72,7 +72,6 @@ getOutlierContrasts <- function(sefiles, cores) {
   ]
 
   # Compute sample-level failures based on global information
-  message("Computing outliers based on global distributions...")
   # fmt: skip
   metadata[, `:=`(is_outlier_avg_frag_length_mean = coriell::outliers_by_mad(avg_frag_length_mean),                                
                   is_outlier_avg_frag_length_sd = coriell::outliers_by_mad(avg_frag_length_sd),                                 
@@ -87,7 +86,6 @@ getOutlierContrasts <- function(sefiles, cores) {
                   ), by = library_layout]
 
   # Get contrast to group mapping
-  message("Reading in group to contrast mapping...")
   cm_dt <- data.table::rbindlist(
     parallel::mclapply(sefiles, getContrasts, mc.cores = cores),
     idcol = "BioProject"
@@ -97,7 +95,6 @@ getOutlierContrasts <- function(sefiles, cores) {
   cm_dt[, group_id := paste(BioProject, group, sep = ".")]
 
   # Collect groups with samples that failed QC for some reason
-  message("Determining groups with outlier samples...")
   has_outlier_avg_frag_length_mean <- metadata[
     is_outlier_avg_frag_length_mean == TRUE,
     unique(group_id)
@@ -153,7 +150,6 @@ getOutlierContrasts <- function(sefiles, cores) {
                outlier_avg_percent_mapped = group_id %in% has_outlier_avg_percent_mapped)]
 
   # Now collect the contrasts with the potential outliers
-  message("Determining contrasts with outlier groups...")
   con_outlier_avg_frag_length_mean <- cm_dt[
     outlier_avg_frag_length_mean == TRUE,
     unique(id)
@@ -219,6 +215,73 @@ getOutlierFlags <- function(l, sep = ",") {
     cols <- names(l)[which(row)]
     paste(cols, collapse = sep)
   })
+
+  return(result)
+}
+
+
+# Extract a data.table mapping IDs to all unique library types of BioSamples present in that Contrast
+getLibraryStrategy <- function(sefiles, cores) {
+  # Read in bioSample metadata
+  biosample_dt <- data.table::rbindlist(
+    parallel::mclapply(sefiles, getSampleMetadata, mc.cores = cores),
+    fill = TRUE,
+    idcol = "BioProject"
+  )
+  biosample_dt[, group_id := paste(BioProject, group, sep = ".")]
+  keep <- c(
+    "BioProject",
+    "BioSample",
+    "group",
+    "group_id",
+    "salmon_version",
+    "library_types",
+    "avg_frag_length_mean",
+    "avg_frag_length_sd",
+    "avg_num_eq_classes",
+    "avg_num_processed",
+    "avg_num_mapped",
+    "avg_num_decoy_fragments",
+    "avg_num_dovetail_fragments",
+    "avg_num_fragments_filtered_vm",
+    "avg_num_alignments_below_threshold_vm",
+    "avg_percent_mapped"
+  )
+  biosample_dt <- biosample_dt[, ..keep]
+  biosample_dt[,
+    library_layout := data.table::fifelse(
+      library_types %like% "^[IOM]",
+      "PAIRED",
+      "SINGLE"
+    )
+  ]
+
+  # Read in the contrast-biosample mapping
+  cm_dt <- data.table::rbindlist(
+    parallel::mclapply(sefiles, getContrasts, mc.cores = cores),
+    idcol = "BioProject"
+  )
+  cm_dt <- cm_dt[is_member != 0]
+  cm_dt[, id := paste(BioProject, contrast, sep = ".")]
+  cm_dt[, group_id := paste(BioProject, group, sep = ".")]
+
+  # Join BioSample data to Contrasts
+  merged <- merge(
+    x = cm_dt,
+    y = biosample_dt,
+    by = "group_id",
+    all.x = TRUE,
+    allow.cartesian = TRUE
+  )
+
+  # Collect only the unique ID and library type information
+  result <- merged[,
+    .(
+      library_types = paste(unique(library_types), collapse = ", "),
+      library_layout = paste(unique(library_layout), collapse = ", ")
+    ),
+    by = id
+  ]
 
   return(result)
 }

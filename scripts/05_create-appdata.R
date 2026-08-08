@@ -55,6 +55,7 @@ if (any(!file.exists(c(metafile, cellfile, drugfile)))) {
 metadata <- fread(metafile)
 drugs <- fread(drugfile)
 cells <- fread(cellfile)
+lib_strategies <- getLibraryStrategy(se_files, N_CORES)
 
 # Which IDs are annotated in the metadata?
 analyzed_ids <- de[, unique(id)]
@@ -89,6 +90,9 @@ if (length(missing_data) > 0) {
 message("Inner joining metadata onto differential expression data...")
 metadata <- metadata[drugs, on = "treatment", nomatch = 0L]
 metadata <- metadata[cells, on = "cell_line", nomatch = 0L]
+
+# Library strategies need left join
+metadata <- merge(metadata, lib_strategies, by = "id", all.x = TRUE)
 
 message("Flagging contrasts with potential outliers...")
 outliers <- getOutlierContrasts(se_files, cores = N_CORES)
