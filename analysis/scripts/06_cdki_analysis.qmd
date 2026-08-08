@@ -492,14 +492,15 @@ col_anno$cdk_class <- factor(
   levels = c("Transcriptional", "Cell cycle", "Pan-CDK")
 )
 col_anno <- col_anno[order(col_anno$cdk_class), ]
+rownames(col_anno) <- gsub("PRJNA[0-9]+\\.", "", rownames(col_anno))
 
 # Create annotations for observed
 cls_pal <- as.character(paletteer::paletteer_d("PNWColors::Bay"))
 names(cls_pal) <- levels(te_class)
 
-pdf(here(figures, "contrast-z-heatmap.pdf"), width = 16, height = 10)
+pdf(here(figures, "contrast-z-heatmap.pdf"), width = 18, height = 10)
 ht_contrasts <- Heatmap(
-  raw_m,
+  raw_m[, rownames(col_anno)],
   name = "z-score",
   col = circlize::colorRamp2(c(-3, 0, 3), c("#377EB8", "white", "#E41A1C")),
   right_annotation = rowAnnotation(Class = te_class, col = list(Class = cls_pal)),
@@ -509,9 +510,9 @@ ht_contrasts <- Heatmap(
   ),
   row_split = te_class,
   column_split = col_anno$cdk_class,
+  cluster_columns = TRUE,
   cluster_rows = TRUE,
   cluster_row_slices = FALSE,
-  cluster_columns = TRUE,
   show_row_names = FALSE,
   row_names_gp = gpar(fontsize = 4),
   column_names_gp = gpar(fontsize = 10),
