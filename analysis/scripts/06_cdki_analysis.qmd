@@ -165,17 +165,66 @@ for (trt in trts) {
 }
 ```
 
+Classify transcriptional, cell cycle, pan-cdk.
+
+https://www.nature.com/articles/s41392-024-02080-z/figures/2
+
+```{r}
+# defined from above paper
+cell_cycle_cdks <- c("CDK1", "CDK2", "CDK3", "CDK4", "CDK6")
+transcriptional_cdks <- c(
+  "CDK8",
+  "CDK19",
+  "CDK12",
+  "CDK13",
+  "CDK9",
+  "CDK20",
+  "CDK7",
+  "CDK10",
+  "CDK11"
+)
+
+# Build regex patterns for each class
+cc_pattern <- paste0("\\b(", paste(cell_cycle_cdks, collapse = "|"), ")\\b")
+tx_pattern <- paste0("\\b(", paste(transcriptional_cdks, collapse = "|"), ")\\b")
+
+db$cdk_class <- fcase(
+  grepl(cc_pattern, db$targets) & grepl(tx_pattern, db$targets) , "Pan-CDK"         ,
+  grepl(cc_pattern, db$targets)                                 , "Cell cycle"      ,
+  grepl(tx_pattern, db$targets)                                 , "Transcriptional" ,
+  default = "Other/Unknown"
+)
+```
+
+Add the cdk_class counts
+
+```{r}
+class_counts <- sort(
+  table(subset(colData(db), mechanism_of_action == "cdk inhibitor")$cdk_class),
+  decreasing = TRUE
+)
+cdki_counts <- c(cdki_counts, class_counts)
+```
+
 ## Perform meta-analysis on these data
 
 Some have only one contrast so these are just the input data.
 
 ```{r}
+cdk_classes <- c("Transcriptional", "Cell cycle", "Pan-CDK")
+test_cases <- c(trts, cdk_classes)
+
 meta_results_file <- here(rdsfiles, "cdki-meta-results.rds")
 if (!(file.exists(meta_results_file))) {
   meta_results <- parallel::mclapply(
-    trts,
+    test_cases,
     function(x) {
-      se <- db[, db$treatment == x]
+      if (x %in% cdk_classes) {
+        se <- db[, db$mechanism_of_action == "cdk inhibitor" & db$cdk_class == x]
+      } else {
+        se <- db[, db$treatment == x]
+      }
+
       result <- meta_de(
         se,
         FUN = metapod::parallelFisher,
@@ -184,11 +233,13 @@ if (!(file.exists(meta_results_file))) {
       )
       result <- result[!is.na(Meta.Pval)]
       result[, Meta.FDR := p.adjust(Meta.Pval, method = "BH")]
+
       return(result)
     },
-    mc.cores = 16
+    mc.cores = length(test_cases)
   )
-  names(meta_results) <- trts
+
+  names(meta_results) <- test_cases
 
   saveRDS(meta_results, meta_results_file)
 } else {
@@ -199,14 +250,18 @@ if (!(file.exists(meta_results_file))) {
 Perform Jackknife resampling to assess stability
 
 ```{r}
-process_jackknife <- function(treatment, prefix, db, run_flag) {
-  message(sprintf("Running %s jacknife meta-analysis...", treatment))
-
+process_jackknife <- function(x) {
   metafun <- function(x) {
     coriell::meta_de(x, metapod::parallelFisher, pval = "P.Value", se = "SE")
   }
 
-  res <- jackknifeSE(db[, db$treatment == treatment], FUN = metafun)
+  if (x %in% cdk_classes) {
+    data <- db[, db$mechanism_of_action == "cdk inhibitor" & db$cdk_class == x]
+  } else {
+    data <- db[, db$treatment == x]
+  }
+
+  res <- jackknifeSE(data, FUN = metafun)
   res <- rbindlist(res, idcol = "Jackknife")
 
   res <- res[!is.na(Meta.Pval)]
@@ -217,15 +272,8 @@ process_jackknife <- function(treatment, prefix, db, run_flag) {
 
 jk_results_file <- here(rdsfiles, "cdki-jackknife-stats.rds")
 if (!(file.exists(jk_results_file))) {
-  jk_results <- lapply(trts, function(x) {
-    process_jackknife(
-      treatment = x,
-      prefix = x,
-      db = db,
-      run_flag = run
-    )
-  })
-  names(jk_results) <- trts
+  jk_results <- parallel::mclapply(test_cases, process_jackknife, mc.cores = length(test_cases))
+  names(jk_results) <- test_cases
   saveRDS(jk_results, jk_results_file)
 } else {
   jk_results <- readRDS(jk_results_file)
@@ -320,12 +368,16 @@ jack_stats[is.na(Bias), SE := NaN]
 
 # Determine the order on the plot
 lvls <- jack_stats[
-  FeatureType == "Protein Coding Genes" &
-    Direction == "Down"
-][order(Observed, decreasing = TRUE)][,
-  Compound
-]
-jack_stats[, Compound := factor(Compound, levels = lvls)]
+  FeatureType == "Protein Coding Genes" & Direction == "Down",
+  Compound[order(-Observed)]
+] |>
+  forcats::fct_inorder() |>
+  forcats::fct_relevel(
+    c("Cell cycle (n=22)", "Pan-CDK (n=12)", "Transcriptional (n=29)"),
+    after = 18L
+  )
+
+jack_stats[, Compound := factor(Compound, levels(lvls))]
 ```
 
 Plot the results of the meta-analysis with the SE from the Jackknife estimates
@@ -340,7 +392,7 @@ ggplot(jack_stats, aes(x = Compound, y = Observed, fill = Direction)) +
     labels = c("Up" = "Meta Up-regulated", "Down" = "Meta Down-regulated")
   ) +
   scale_y_continuous(labels = \(x) paste0(abs(x), "%"), n.breaks = 10, limits = c(-100, 100)) +
-  #geom_hline(linetype = 1, yintercept = 0, color = "black", linewidth = 0.5) +
+  geom_vline(xintercept = 15.5, linetype = 2) +
   coord_flip() +
   labs(
     fill = NULL,
@@ -358,59 +410,6 @@ ggplot(jack_stats, aes(x = Compound, y = Observed, fill = Direction)) +
     strip.text = element_text(size = 14, face = "bold")
   )
 ggsave(here(figures, "cdki-meta-results-barplot.pdf"), width = 12, height = 6, bg = "white")
-```
-
-## Show meta-lfc values as a heatmap across conditions
-
-Extract meta results as a matrix
-
-```{r}
-meta_results_dt <- rbindlist(meta_results, idcol = "Compound")
-
-# Cast into a matrix for ComplexHeatmap
-lfc_mat <- meta_results_dt[Feature %like% ".*\\..*\\..*"]
-lfc_mat <- dcast(lfc_mat, Feature ~ Compound, value.var = "Meta.logFC")
-lfc_mat <- as.matrix(lfc_mat, rownames = "Feature")
-
-# Limit to TEs observed across all compounds
-lfc_mat <- lfc_mat[!matrixStats::rowAnyNAs(lfc_mat), ]
-
-# Name the columns with the number of contrassts
-colnames(lfc_mat) <- paste0(colnames(lfc_mat), " (n=", cdki_counts[colnames(lfc_mat)], ")")
-```
-
-Generate a heatmap at the meta-compund level showing the TE dysregulation
-
-```{r}
-# Create the row annotation
-row_anno <- tstrsplit(rownames(lfc_mat), "\\.")
-te_class <- factor(row_anno[[1]], levels = c("SINE", "LINE", "LTR", "DNA", "Retroposon"))
-
-# Create annotations for observed
-cls_pal <- as.character(paletteer::paletteer_d("PNWColors::Bay"))
-names(cls_pal) <- levels(te_class)
-
-pdf(here(figures, "meta-te-lfc-heatmap.pdf"), width = 8, height = 10)
-ht <- Heatmap(
-  lfc_mat,
-  name = "Meta logFC",
-  col = circlize::colorRamp2(c(-3, 0, 3), c("#377EB8", "white", "#E41A1C")),
-  right_annotation = rowAnnotation(Class = te_class, col = list(Class = cls_pal)),
-  row_split = te_class,
-  cluster_rows = TRUE,
-  cluster_row_slices = FALSE,
-  cluster_columns = TRUE,
-  show_row_names = FALSE,
-  row_names_gp = gpar(fontsize = 4),
-  column_names_gp = gpar(fontsize = 12),
-  row_title_rot = 0,
-  row_gap = unit(2, "mm"),
-  border = FALSE,
-  column_names_rot = 45,
-  column_title_gp = gpar(fontsize = 14, fontface = "bold")
-)
-draw(ht, padding = unit(c(20, 2, 2, 2), "mm"))
-dev.off()
 ```
 
 ## Explore overlapping targets for each compound
@@ -434,15 +433,29 @@ colnames(binary_mat) <- all_targets
 # Order the cols by target name
 col_o <- gtools::mixedsort(colnames(binary_mat))
 
-# Keep the same order as in the heatmap
-ht_cols <- colnames(lfc_mat)[column_order(ht)]
-ht_cols <- gsub(" \\(.*", "", ht_cols)
+# Group the compouns by their CDK class
+row_anno <- unique(colData(db)[db$treatment %in% trts, c("treatment", "cdk_class")])
+rownames(row_anno) <- row_anno$treatment
+row_anno$cdk_class <- factor(
+  row_anno$cdk_class,
+  levels = c("Transcriptional", "Cell cycle", "Pan-CDK")
+)
+row_anno <- row_anno[order(row_anno$cdk_class), ]
+
+cdk_pal <- RColorBrewer::brewer.pal(n = 3, "Dark2")
+names(cdk_pal) <- levels(row_anno$cdk_class)
 
 pdf(here(figures, "compound-target-heatmap.pdf"), width = 9, height = 6)
 ht_targets <- Heatmap(
-  binary_mat[ht_cols, col_o],
+  binary_mat[rownames(row_anno), col_o],
   name = "Target",
   col = structure(c("white", "#1F78B4"), names = c("0", "1")),
+  right_annotation = rowAnnotation(
+    `CDK Class` = row_anno$cdk_class,
+    col = list(`CDK Class` = cdk_pal)
+  ),
+  row_split = row_anno$cdk_class,
+  row_gap = unit(5, "mm"),
   rect_gp = gpar(col = "grey80", lwd = 1),
   cluster_rows = FALSE,
   show_row_dend = FALSE,
@@ -456,7 +469,7 @@ draw(ht_targets, padding = unit(c(2, 10, 2, 2), "mm"))
 dev.off()
 ```
 
-## Would it be useful to show all 63 contrasts data?
+## Show data for all 63 of the included contrasts
 
 ```{r}
 # Extract the raw DE data from the database for all contrasts
@@ -472,8 +485,13 @@ colnames(raw_m) <- gsub("PRJNA[0-9]+\\.", "", colnames(raw_m))
 row_anno <- tstrsplit(rownames(raw_m), "\\.")
 te_class <- factor(row_anno[[1]], levels = c("SINE", "LINE", "LTR", "DNA", "Retroposon"))
 
-# Split the columns by treatment
-col_trts <- db[, db$treatment %chin% trts]$treatment
+# Split the columns by CDK class
+col_anno <- colData(db)[db$treatment %in% trts, c("treatment", "cdk_class")]
+col_anno$cdk_class <- factor(
+  col_anno$cdk_class,
+  levels = c("Transcriptional", "Cell cycle", "Pan-CDK")
+)
+col_anno <- col_anno[order(col_anno$cdk_class), ]
 
 # Create annotations for observed
 cls_pal <- as.character(paletteer::paletteer_d("PNWColors::Bay"))
@@ -485,8 +503,12 @@ ht_contrasts <- Heatmap(
   name = "z-score",
   col = circlize::colorRamp2(c(-3, 0, 3), c("#377EB8", "white", "#E41A1C")),
   right_annotation = rowAnnotation(Class = te_class, col = list(Class = cls_pal)),
+  top_annotation = columnAnnotation(
+    `CDK Class` = col_anno$cdk_class,
+    col = list(`CDK Class` = cdk_pal)
+  ),
   row_split = te_class,
-  column_split = col_trts,
+  column_split = col_anno$cdk_class,
   cluster_rows = TRUE,
   cluster_row_slices = FALSE,
   cluster_columns = TRUE,
@@ -502,4 +524,97 @@ ht_contrasts <- Heatmap(
 )
 draw(ht_contrasts, padding = unit(c(20, 40, 20, 20), "mm"))
 dev.off()
+```
+
+## Perform gene set testing on the CDKi meta-results
+
+```{r}
+hallmark <- msigdbr::msigdbr(
+  db_species = "HS",
+  species = "human",
+  collection = "H"
+)
+hallmark <- split(as.character(hallmark$gene_symbol), hallmark$gs_name)
+
+ifn <- hallmark[c(
+  "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+  "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+  "HALLMARK_INFLAMMATORY_RESPONSE"
+)]
+```
+
+### Run CAMERA
+
+```{r}
+run_camera <- function(x) {
+  stats <- x[, Meta.z]
+  names(stats) <- x[, Feature]
+
+  idx <- limma::ids2indices(ifn, names(stats))
+  result <- setDT(
+    limma::cameraPR(stats, idx, use.ranks = TRUE),
+    keep.rownames = "pathway"
+  )
+
+  return(list(result = result, stats = stats, idx = idx))
+}
+
+camera_results <- lapply(meta_results, run_camera)
+
+camera_results_dt <- rbindlist(
+  lapply(camera_results, `[[`, "result"),
+  idcol = "treatment"
+)
+fwrite(
+  camera_results_dt,
+  here(datafiles, "meta-camerapr-results.tsv"),
+  sep = "\t"
+)
+```
+
+### Run FGSEA
+
+```{r}
+run_fgsea <- function(x) {
+  stats <- x[, Meta.z]
+  names(stats) <- x[, Feature]
+
+  result <- fgsea::fgsea(
+    pathways = ifn,
+    stats = stats,
+    nPermSimple = 1e4,
+    eps = 0.0,
+    scoreType = "pos"
+  )
+
+  return(list(result = result, stats = stats))
+}
+
+fgsea_results <- lapply(meta_results, run_fgsea)
+
+fgsea_results_dt <- rbindlist(
+  lapply(fgsea_results, `[[`, "result"),
+  idcol = "treatment"
+)
+fwrite(fgsea_results_dt, here(datafiles, "meta-fgsea-results.tsv"), sep = "\t")
+```
+
+### Plot enrichment results
+
+```{r}
+ggplot(fgsea_results_dt, aes(x = pathway, y = NES, fill = -log10(padj))) +
+  geom_col(position = "dodge", color = "white") +
+  facet_wrap(~treatment) +
+  coord_flip() +
+  scale_fill_viridis_c() +
+  labs(y = "Normalized Enrichment Score", x = NULL, fill = "-log10(adjusted p-value)") +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold", size = 16))
+ggsave(here(figures, "meta-enrichment-scores.pdf"), width = 18, height = 10, bg = "white")
+```
+
+## Label by transcriptional / cell cycle / pan-cdk
+
+```{r}
+
 ```
