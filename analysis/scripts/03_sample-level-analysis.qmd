@@ -15,7 +15,7 @@ suppressPackageStartupMessages(library(Hmisc))
 suppressPackageStartupMessages(library(SummarizedExperiment))
 suppressPackageStartupMessages(library(patchwork))
 suppressPackageStartupMessages(library(paletteer))
-
+suppressPackageStartupMessages(library(ComplexHeatmap))
 
 datafiles <- here("analysis", "results", "data-files", "03")
 figures <- here("analysis", "results", "figures", "03")
@@ -322,6 +322,146 @@ coldata[, outlier := (avg_num_mapped_outlier | avg_percent_mapped_outlier)]
 # Assign back to SE object
 stopifnot(all(coldata$BioSample == colnames(se)))
 se <- se[, coldata$outlier == FALSE]
+```
+
+## Examine feature detection by library type
+
+```{r}
+# Convert to a binary matrix
+detected <- assay(se, "counts") > 0
+detected <- detected * 1
+
+# Sum the indicator based on the group membership
+detected_counts <- edgeR::sumTechReps(detected, ID = se$library_types)
+
+# Only care about features that were detected in any
+detected_counts <- detected_counts[rowSums(detected_counts) > 0, ]
+
+# Take the proportions within each
+libtype_counts <- table(se$library_types)[colnames(detected_counts)]
+detected_props <- sweep(detected_counts, 2, libtype_counts, FUN = '/')
+
+# Exclude the single "SF;U" sample
+detected_props <- detected_props[, colnames(detected_props) != "SF;U"]
+
+# Extract only the TE features
+detected_tes <- detected_props[
+  rownames(detected_props) %like% "^LINE\\.|^SINE\\.|^LTR\\.|.*\\.SVA\\..*|^DNA\\.",
+]
+
+# Coerce to a long data.table for plotting
+detected_tes_dt <- as.data.table(detected_tes, keep.rownames = "repElem")
+detected_tes_dt[, c("Class", "Family", "Subfamily") := tstrsplit(repElem, ".", fixed = TRUE)]
+detected_tes_dt.m <- melt(detected_tes_dt, measure.vars = c("IU", "U", "SR", "SF", "ISR", "ISF"))
+
+# Add the count information
+detected_tes_dt.m <- merge(
+  x = detected_tes_dt.m,
+  y = data.table(variable = names(libtype_counts), Counts = as.integer(libtype_counts)),
+  all.x = TRUE,
+  by = "variable"
+)
+detected_tes_dt.m[, label := paste0(variable, "\n(n=", Counts, ")")]
+```
+
+How do I plot this? As a histogram by TE Class maybe?
+
+```{r}
+te_pal <- c(
+  "SINE" = "#00496FFF",
+  "LINE" = "#0F85A0FF",
+  "LTR" = "#EDD746FF",
+  "DNA" = "#ED8B00FF",
+  "Retroposon" = "#DD4124FF"
+)
+
+ggplot(detected_tes_dt.m, aes(x = value)) +
+  geom_histogram(aes(fill = Class), bins = 10, color = "white") +
+  scale_fill_manual(values = te_pal) +
+  geom_hline(yintercept = 0) +
+  facet_grid(Class ~ label, scales = "free_y") +
+  labs(
+    x = "Proportion of Libraries Where Subfamily is Detected",
+    y = "Number of Detected Subfamilies",
+    fill = NULL
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 16, face = "bold"),
+    strip.background = element_blank()
+  )
+ggsave(here(figures, "detected-prop-by-libtype.pdf"), width = 12, height = 8, bg = "white")
+```
+
+What are the most biased subfamilies? Do this by assessing variability in detection rates.
+
+```{r}
+# Extract the most variabliy detected TEs across libtypes
+v <- matrixStats::rowVars(detected_tes)
+ov <- order(v, decreasing = TRUE)
+variable_detected_tes <- detected_tes[head(ov, 100), ]
+
+# Create row and coldata
+row_anno <- tstrsplit(rownames(variable_detected_tes), ".", fixed = TRUE)
+te_class <- factor(row_anno[[1]], levels = c("SINE", "LINE", "LTR", "DNA", "Retroposon"))
+
+# Now just use the subfamily as the rownames
+rownames(variable_detected_tes) <- row_anno[[3]]
+
+pdf(here(figures, "variable-te-heatmap.pdf"), width = 12, height = 10, bg = "white")
+ht <- Heatmap(
+  variable_detected_tes,
+  name = "Proportion Detected",
+  col = hcl.colors(n = 100, palette = "RdYlBu", rev = TRUE),
+  right_annotation = rowAnnotation(Class = te_class, col = list(Class = te_pal)),
+  row_split = te_class,
+  cluster_columns = TRUE,
+  cluster_rows = TRUE,
+  cluster_row_slices = FALSE,
+  show_row_names = TRUE,
+  row_names_gp = gpar(fontsize = 6),
+  column_names_gp = gpar(fontsize = 14),
+  row_title_rot = 0,
+  row_gap = unit(2, "mm"),
+  border = FALSE,
+  column_names_rot = 45,
+  column_title = "Top 100 Most Variably Detected Subfamilies",
+  column_title_gp = gpar(fontsize = 16, fontface = "bold")
+)
+draw(ht, padding = unit(c(20, 40, 20, 20), "mm"))
+dev.off()
+```
+
+Maybe a parallel coordinates plot would showe this better?
+
+```{r}
+ggplot(detected_tes_dt.m, aes(x = variable, y = value, group = repElem, color = Class)) +
+  geom_line(alpha = 0.2) +
+  scale_color_manual(values = te_pal) +
+  facet_wrap(~Class, ncol = 5) +
+  labs(
+    x = "Library Type",
+    y = "Proportion of Libraries\nWhere Subfamily is Detected",
+    color = NULL
+  ) +
+  guides(color = guide_legend(override.aes = list(alpha = 1))) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major = element_line(linetype = 3, color = "grey80"),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 16, face = "bold"),
+    axis.ticks = element_line()
+  )
+ggsave(here(figures, "detected-te-parcoord.pdf"), width = 16, height = 4, bg = "white")
+```
+
+Do most of the SF libs come from one BioProject? These data are heavily skewed by a single 
+bioproject, PRJNA821516, with 1,727 BioSamples.
+
+```{r}
+samples_by_libtype <- as.matrix(table(BioProject = se$BioProject, LibType = se$library_types))
+which.max(samples_by_libtype[, "SF"])
 ```
 
 ## Determine control samples
