@@ -327,9 +327,10 @@ se <- se[, coldata$outlier == FALSE]
 ## Examine feature detection by library type
 
 ```{r}
+cpms <- edgeR::cpm(assay(se, "counts"))
+
 # Convert to a binary matrix
-detected <- assay(se, "counts") > 0
-detected <- detected * 1
+detected <- (cpms > 1) * 1
 
 # Sum the indicator based on the group membership
 detected_counts <- edgeR::sumTechReps(detected, ID = se$library_types)
@@ -456,12 +457,73 @@ ggplot(detected_tes_dt.m, aes(x = variable, y = value, group = repElem, color = 
 ggsave(here(figures, "detected-te-parcoord.pdf"), width = 16, height = 4, bg = "white")
 ```
 
-Do most of the SF libs come from one BioProject? These data are heavily skewed by a single 
-bioproject, PRJNA821516, with 1,727 BioSamples.
+### Perform a KS test within each Class to test for distributional differences
 
 ```{r}
-samples_by_libtype <- as.matrix(table(BioProject = se$BioProject, LibType = se$library_types))
-which.max(samples_by_libtype[, "SF"])
+runKSTests <- function(data) {
+  variables <- c("ISF", "ISR", "IU", "SF", "SR", "U")
+  classes <- c("DNA", "LINE", "LTR", "Retroposon", "SINE")
+
+  var_pairs <- combn(variables, 2, simplify = FALSE)
+
+  results <- list()
+  for (cls in classes) {
+    for (pair in var_pairs) {
+      v1 <- pair[1]
+      v2 <- pair[2]
+
+      val1 <- data$value[data$variable == v1 & data$Class == cls]
+      val2 <- data$value[data$variable == v2 & data$Class == cls]
+
+      if (length(val1) > 0 && length(val2) > 0) {
+        test_res <- suppressWarnings(ks.test(val1, val2, exact = FALSE))
+
+        results[[length(results) + 1]] <- data.frame(
+          Class = cls,
+          Var1 = v1,
+          Var2 = v2,
+          D_statistic = test_res$statistic,
+          p_value = test_res$p.value,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+
+  results <- do.call(rbind, results)
+  results$p_adj <- p.adjust(results$p_value, method = "bonferroni")
+  results <- results[order(results$p_adj), ]
+
+  return(results)
+}
+
+ks_tests <- runKSTests(detected_tes_dt.m)
+```
+
+Display comparisons as a heatmap?
+
+```{r}
+ggplot(ks_tests, aes(x = Var1, y = Var2, fill = D_statistic)) +
+  geom_tile(color = "white", size = 0.5) +
+  geom_text(aes(label = ifelse(p_adj < 0.05, "*", "")), color = "black", size = 6, vjust = 0.75) +
+  facet_wrap(~Class, nrow = 1) +
+  scale_fill_gradientn(
+    colors = c("#FDE725FF", "#21908CFF", "#440154FF"),
+    name = "D Statistic\n(Effect Size)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold", size = 12)
+  ) +
+  labs(
+    title = "Pairwise Kolmogorov-Smirnov Tests by Class",
+    subtitle = "Asterisks (*) indicate significant difference (Bonferroni-adjusted p < 0.05)",
+    x = NULL,
+    y = NULL
+  )
+ggsave(here(figures, "ks-test-significance.pdf"), width = 11, height = 6, bg = "white")
 ```
 
 ## Determine control samples
