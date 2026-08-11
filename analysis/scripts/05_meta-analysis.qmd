@@ -1110,11 +1110,12 @@ Show plots of proportions
 # png(here(figures, "te-prop-trend.png"), width = 12, height = 5, units = "in", res = 300)
 pdf(here(figures, "te-prop-trend.pdf"), width = 12, height = 5)
 par(mfrow = c(1, 3), mar = c(5, 5, 4, 2) + 0.1)
+
 # Interferon Alpha
 p <- barplot(
   ifn_alpha_tbl[2, ] / colSums(ifn_alpha_tbl),
   xlab = NULL,
-  ylab = "Proportion of Contrasts Enriched",
+  ylab = "Proportion of Contrasts Positively Enriched",
   main = "Interferon Alpha Response",
   col = "cornflowerblue",
   ylim = c(0, 0.4),
@@ -1155,7 +1156,6 @@ text(
 )
 
 # Inflammatory response
-# Interferon Gamma
 p <- barplot(
   inflam_tbl[2, ] / colSums(inflam_tbl),
   xlab = NULL,
@@ -1179,37 +1179,65 @@ text(
 dev.off()
 ```
 
-Alternative plot showing all counts in 'Enriched' and 'Not enriched'. The previous plot is clearer
-in it's intent. 
+### What are the compounds that have low levels of TEs but still enrich viral-mimicry signatures
 
 ```{r}
-# Labels for strip text
-pathway_names <- c(
-  "HALLMARK_INTERFERON_ALPHA_RESPONSE" = "Interferon Alpha Response",
-  "HALLMARK_INTERFERON_GAMMA_RESPONSE" = "Interferon Gamma Response",
-  "HALLMARK_INFLAMMATORY_RESPONSE" = "Inflammatory Response"
-)
+# Find those compounds where all 3 are enriched
+ifn_props[is_enriched == "Enriched", enriched_n := .N, by = Contrast]
 
-ggplot(enrich_counts, aes(te_label, Prop, fill = is_enriched, label = n_label)) +
-  geom_col(alpha = 0.9, color = "black", position = position_dodge()) +
-  geom_text(position = position_dodge(width = 0.9), vjust = -1) +
-  scale_fill_manual(values = c("Not Enriched" = "grey80", "Enriched" = "red2")) +
-  scale_y_continuous(expand = c(0, 0), limits = c(0, 0.35)) +
-  facet_wrap(~pathway, labeller = as_labeller(pathway_names)) +
-  labs(x = "Percentage of TEs Up-regulated", y = "Proportion of All Contrasts", fill = NULL) +
-  guides(fill = guide_legend(position = "inside")) +
-  theme_classic() +
-  theme(
-    axis.title = element_text(size = 18),
-    axis.text = element_text(size = 12),
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    strip.text = element_text(size = 18),
-    strip.background = element_blank(),
-    panel.grid.major.y = element_line(color = "grey90", linetype = 2),
-    panel.grid.minor.y = element_line(color = "grey90", linetype = 2),
-    legend.text = element_text(size = 14),
-    legend.position.inside = c(0.5, 0.90)
+# What are the most frequent targets at each percentile that have all three signatures enriched?
+all_enriched <- ifn_props[enriched_n == 3]
+all_enriched_df <- setDT(data.frame(colData(db)[unique(all_enriched$Contrast), ]))
+
+# Join on the TE prop levels
+contrast_cuts <- unique(ifn_props[, .(Contrast, te_cut)])
+all_enriched_df <- contrast_cuts[all_enriched_df, on = c("Contrast" = "id")]
+
+# Label CDKs with their own epigenetic class
+all_enriched_df[mechanism_of_action == "cdk inhibitor", epigenetic_class_fine := "CDKi"]
+
+# Get the unique levels of each variable
+uniqueVars <- function(x, var = "targets") {
+  unlist(strsplit(x[[var]], " | ", fixed = TRUE))
+}
+enriched_by_cut <- split(all_enriched_df, by = "te_cut")
+
+# The count of unique variables in each cut where all pathways are enriched
+target_freqs <- lapply(enriched_by_cut, uniqueVars, var = "targets")
+epi_freqs <- lapply(enriched_by_cut, uniqueVars, var = "epigenetic_class_fine")
+
+# Count the occurences in each
+epi_freqs <- lapply(epi_freqs, \(x) data.frame(table(x)))
+epi_freqs <- rbindlist(epi_freqs, idcol = "te_cut")
+
+target_freqs <- lapply(target_freqs, \(x) data.frame(table(x)))
+target_freqs <- rbindlist(target_freqs, idcol = "te_cut")
+```
+
+Plot the frequency of epigenetic classes at each cut
+
+```{r}
+epi_freqs[,
+  pct_up := fcase(
+    te_cut == "[0.01354,0.96128]" , "[1.3-96%]"  ,
+    te_cut == "[0.00000,0.00274)" , "[0-0.2%)"   ,
+    te_cut == "[0.00274,0.01354)" , "[0.2-1.3%)"
   )
-ggsave(here(figures, "te-enrichment-props.png"), width = 12, height = 6, dpi = 600)
-ggsave(here(figures, "te-enrichment-props.pdf"), width = 12, height = 6)
+][, pct_up := factor(pct_up, levels = c("[0-0.2%)", "[0.2-1.3%)", "[1.3-96%]"))]
+
+pdf(here(figures, "contrast-freq-by-te-prop.pdf"), width = 9, height = 5, bg = "white")
+tinyplot::tinyplot(
+  Freq ~ pct_up | x,
+  beside = TRUE,
+  data = epi_freqs,
+  type = "barplot",
+  palette = "Dark 2",
+  theme = "clean2",
+  main = "Epigenetic Classes of Contrasts Where All Three Pathways Are Positively Enriched",
+  sub = "Positive Enrichment: NES > 0 & FDR < 0.1",
+  ylab = "Number of Contrasts",
+  xlab = "Percentage TE Up-regulation",
+  legend = list("bottom!", title = NULL)
+)
+dev.off()
 ```
