@@ -326,6 +326,48 @@ se <- se[, coldata$outlier == FALSE]
 
 ## Examine feature detection by library type
 
+First look at the average expression for each family by library type
+
+```{r}
+lcpm_by_libtype <- edgeR::cpmByGroup(
+  assay(se, "counts"),
+  group = se$library_types,
+  log = TRUE,
+  prior.count = 2
+)
+
+# Convert to data.table and keep only TEs
+lcpm_by_libtype_dt <- as.data.table(lcpm_by_libtype, keep.rownames = "Feature")
+lcpm_by_libtype_dt <- lcpm_by_libtype_dt[
+  Feature %like% "^LINE\\.|^SINE\\.|^LTR\\.|.*\\.SVA\\..*|^DNA\\.",
+]
+lcpm_by_libtype_dt[, c("Class", "Family", "Subfamily") := tstrsplit(Feature, ".", fixed = TRUE)]
+
+lcpm_by_libtype_dt.m <- melt(
+  lcpm_by_libtype_dt,
+  id.vars = c("Feature", "Class"),
+  measure.vars = c("ISF", "ISR", "IU", "SF", "SR", "U")
+)
+```
+
+```{r}
+ggplot(lcpm_by_libtype_dt.m, aes(x = value)) +
+  geom_histogram(bins = 20, fill = "cornflowerblue", color = "white", alpha = 0.9) +
+  scale_x_continuous(labels = \(x) 2^x) +
+  facet_grid(Class ~ variable, scales = "free_y") +
+  labs(x = "Expression-level: Count-per-million (CPM)", y = "Count of Subfamilies") +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.text = element_text(size = 16, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+ggsave(here(figures, "expression-by-libtype.pdf"), width = 14, height = 8, bg = "white")
+```
+
+Examine by detectability
+
 ```{r}
 cpms <- edgeR::cpm(assay(se, "counts"))
 
