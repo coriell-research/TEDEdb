@@ -613,9 +613,3 @@ ggplot(fgsea_results_dt, aes(x = pathway, y = NES, fill = -log10(padj))) +
   theme(legend.position = "bottom", strip.text = element_text(face = "bold", size = 16))
 ggsave(here(figures, "meta-enrichment-scores.pdf"), width = 18, height = 10, bg = "white")
 ```
-
-## Label by transcriptional / cell cycle / pan-cdk
-
-```{r}
-
-```
