@@ -350,8 +350,10 @@ lcpm_by_libtype_dt.m <- melt(
 )
 ```
 
+Show as histograms. For each plot only include CPM > 1 (i.e. log2 CPM > 0)
+
 ```{r}
-ggplot(lcpm_by_libtype_dt.m, aes(x = value)) +
+ggplot(lcpm_by_libtype_dt.m[value > 0], aes(x = value)) +
   geom_histogram(bins = 20, fill = "cornflowerblue", color = "white", alpha = 0.9) +
   scale_x_continuous(labels = \(x) 2^x) +
   facet_grid(Class ~ variable, scales = "free_y") +
@@ -366,7 +368,112 @@ ggplot(lcpm_by_libtype_dt.m, aes(x = value)) +
 ggsave(here(figures, "expression-by-libtype.pdf"), width = 14, height = 8, bg = "white")
 ```
 
-Examine by detectability
+Could also show as beeswarms
+
+```{r}
+te_pal <- c(
+  "SINE" = "#00496FFF",
+  "LINE" = "#0F85A0FF",
+  "LTR" = "#EDD746FF",
+  "DNA" = "#ED8B00FF",
+  "Retroposon" = "#DD4124FF"
+)
+
+ggplot(lcpm_by_libtype_dt.m[value > 0], aes(x = variable, y = value, color = Class)) +
+  ggbeeswarm::geom_quasirandom(shape = 16, alpha = 0.8) +
+  stat_summary(
+    fun = median,
+    fun.min = median,
+    fun.max = median,
+    geom = "crossbar",
+    width = 0.5,
+    color = "red"
+  ) +
+  scale_color_manual(values = te_pal) +
+  scale_y_continuous(labels = \(x) 2^x) +
+  facet_wrap(~Class, nrow = 1) +
+  labs(x = "Inferred Library Type", y = "Count-per-million (CPM)") +
+  guides(color = "none") +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.text = element_text(size = 16, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+ggsave(here(figures, "expression-by-class.pdf"), width = 16, height = 4, bg = "white")
+```
+
+What if I tested the median expression between pairs?
+
+```{r}
+runWilcoxTests <- function(data) {
+  variables <- c("ISF", "ISR", "IU", "SF", "SR", "U")
+  classes <- c("DNA", "LINE", "LTR", "Retroposon", "SINE")
+
+  var_pairs <- combn(variables, 2, simplify = FALSE)
+
+  results <- list()
+  for (cls in classes) {
+    for (pair in var_pairs) {
+      v1 <- pair[1]
+      v2 <- pair[2]
+
+      val1 <- data$value[data$variable == v1 & data$Class == cls]
+      val2 <- data$value[data$variable == v2 & data$Class == cls]
+
+      if (length(val1) > 0 && length(val2) > 0) {
+        test_res <- suppressWarnings(ks.test(val1, val2, exact = FALSE))
+
+        results[[length(results) + 1]] <- data.frame(
+          Class = cls,
+          Var1 = v1,
+          Var2 = v2,
+          statistic = test_res$statistic,
+          p_value = test_res$p.value,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+
+  results <- do.call(rbind, results)
+  results$p_adj <- p.adjust(results$p_value, method = "bonferroni")
+  results <- results[order(results$p_adj), ]
+
+  return(results)
+}
+
+wc_tests <- runWilcoxTests(lcpm_by_libtype_dt.m[value > 0])
+```
+
+Show the results of the pairwise Wilcox tests as a heatmap
+
+```{r}
+ggplot(wc_tests, aes(x = Var1, y = Var2, fill = statistic)) +
+  geom_tile(color = "white", size = 0.5) +
+  geom_text(aes(label = ifelse(p_adj < 0.05, "*", "")), color = "black", size = 6, vjust = 0.75) +
+  facet_wrap(~Class, nrow = 1) +
+  scale_fill_gradientn(
+    colors = c("#FDE725FF", "#21908CFF", "#440154FF"),
+    name = "Test Statistic\n(Effect Size)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold", size = 12)
+  ) +
+  labs(
+    title = "Pairwise Wilcoxon Tests by Class",
+    subtitle = "Asterisks (*) indicate significant difference (Bonferroni-adjusted p < 0.05)",
+    x = NULL,
+    y = NULL
+  )
+ggsave(here(figures, "wc-test-significance.pdf"), width = 11, height = 6, bg = "white")
+```
+
+### Examine by detectability
 
 ```{r}
 cpms <- edgeR::cpm(assay(se, "counts"))
@@ -410,19 +517,12 @@ detected_tes_dt.m[, label := paste0(variable, "\n(n=", Counts, ")")]
 How do I plot this? As a histogram by TE Class maybe?
 
 ```{r}
-te_pal <- c(
-  "SINE" = "#00496FFF",
-  "LINE" = "#0F85A0FF",
-  "LTR" = "#EDD746FF",
-  "DNA" = "#ED8B00FF",
-  "Retroposon" = "#DD4124FF"
-)
-
 ggplot(detected_tes_dt.m, aes(x = value)) +
   geom_histogram(aes(fill = Class), bins = 10, color = "white") +
   scale_fill_manual(values = te_pal) +
   geom_hline(yintercept = 0) +
   facet_grid(Class ~ label, scales = "free_y") +
+  guides(fill = "none") +
   labs(
     x = "Proportion of Libraries Where Subfamily is Detected",
     y = "Number of Detected Subfamilies",
@@ -437,45 +537,6 @@ ggplot(detected_tes_dt.m, aes(x = value)) +
 ggsave(here(figures, "detected-prop-by-libtype.pdf"), width = 12, height = 8, bg = "white")
 ```
 
-What are the most biased subfamilies? Do this by assessing variability in detection rates.
-
-```{r}
-# Extract the most variabliy detected TEs across libtypes
-v <- matrixStats::rowVars(detected_tes)
-ov <- order(v, decreasing = TRUE)
-variable_detected_tes <- detected_tes[head(ov, 100), ]
-
-# Create row and coldata
-row_anno <- tstrsplit(rownames(variable_detected_tes), ".", fixed = TRUE)
-te_class <- factor(row_anno[[1]], levels = c("SINE", "LINE", "LTR", "DNA", "Retroposon"))
-
-# Now just use the subfamily as the rownames
-rownames(variable_detected_tes) <- row_anno[[3]]
-
-pdf(here(figures, "variable-te-heatmap.pdf"), width = 12, height = 10, bg = "white")
-ht <- Heatmap(
-  variable_detected_tes,
-  name = "Proportion Detected",
-  col = hcl.colors(n = 100, palette = "RdYlBu", rev = TRUE),
-  right_annotation = rowAnnotation(Class = te_class, col = list(Class = te_pal)),
-  row_split = te_class,
-  cluster_columns = TRUE,
-  cluster_rows = TRUE,
-  cluster_row_slices = FALSE,
-  show_row_names = TRUE,
-  row_names_gp = gpar(fontsize = 6),
-  column_names_gp = gpar(fontsize = 14),
-  row_title_rot = 0,
-  row_gap = unit(2, "mm"),
-  border = FALSE,
-  column_names_rot = 45,
-  column_title = "Top 100 Most Variably Detected Subfamilies",
-  column_title_gp = gpar(fontsize = 16, fontface = "bold")
-)
-draw(ht, padding = unit(c(20, 40, 20, 20), "mm"))
-dev.off()
-```
-
 Maybe a parallel coordinates plot would showe this better?
 
 ```{r}
@@ -488,7 +549,7 @@ ggplot(detected_tes_dt.m, aes(x = variable, y = value, group = repElem, color = 
     y = "Proportion of Libraries\nWhere Subfamily is Detected",
     color = NULL
   ) +
-  guides(color = guide_legend(override.aes = list(alpha = 1))) +
+  guides(color = "none") +
   theme_minimal(base_size = 14) +
   theme(
     panel.grid.major = element_line(linetype = 3, color = "grey80"),
@@ -499,7 +560,7 @@ ggplot(detected_tes_dt.m, aes(x = variable, y = value, group = repElem, color = 
 ggsave(here(figures, "detected-te-parcoord.pdf"), width = 16, height = 4, bg = "white")
 ```
 
-### Perform a KS test within each Class to test for distributional differences
+Perform a KS test within each Class to test for distributional differences
 
 ```{r}
 runKSTests <- function(data) {
@@ -542,7 +603,7 @@ runKSTests <- function(data) {
 ks_tests <- runKSTests(detected_tes_dt.m)
 ```
 
-Display comparisons as a heatmap?
+Display comparisons as a heatmap
 
 ```{r}
 ggplot(ks_tests, aes(x = Var1, y = Var2, fill = D_statistic)) +
@@ -661,6 +722,227 @@ if (!(file.exists(control_file))) {
 
 ```{r}
 se <- se[, se$BioSample %chin% controls]
+```
+
+## Same expression / detectability analysis on controls only
+
+```{r}
+lcpm_by_libtype <- edgeR::cpmByGroup(
+  assay(se, "counts"),
+  group = se$library_types,
+  log = TRUE,
+  prior.count = 2
+)
+
+# Convert to data.table and keep only TEs
+lcpm_by_libtype_dt <- as.data.table(lcpm_by_libtype, keep.rownames = "Feature")
+lcpm_by_libtype_dt <- lcpm_by_libtype_dt[
+  Feature %like% "^LINE\\.|^SINE\\.|^LTR\\.|.*\\.SVA\\..*|^DNA\\.",
+]
+lcpm_by_libtype_dt[, c("Class", "Family", "Subfamily") := tstrsplit(Feature, ".", fixed = TRUE)]
+
+lcpm_by_libtype_dt.m <- melt(
+  lcpm_by_libtype_dt,
+  id.vars = c("Feature", "Class"),
+  measure.vars = c("ISF", "ISR", "IU", "SF", "SR", "U")
+)
+```
+
+Show as histograms. For each plot only include CPM > 1 (i.e. log2 CPM > 0)
+
+```{r}
+ggplot(lcpm_by_libtype_dt.m[value > 0], aes(x = value)) +
+  geom_histogram(bins = 20, fill = "cornflowerblue", color = "white", alpha = 0.9) +
+  scale_x_continuous(labels = \(x) 2^x) +
+  facet_grid(Class ~ variable, scales = "free_y") +
+  labs(x = "Expression-level: Count-per-million (CPM)", y = "Count of Subfamilies") +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.text = element_text(size = 16, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+ggsave(here(figures, "controls-expression-by-libtype.pdf"), width = 14, height = 8, bg = "white")
+```
+
+Could also show as beeswarms
+
+```{r}
+te_pal <- c(
+  "SINE" = "#00496FFF",
+  "LINE" = "#0F85A0FF",
+  "LTR" = "#EDD746FF",
+  "DNA" = "#ED8B00FF",
+  "Retroposon" = "#DD4124FF"
+)
+
+ggplot(lcpm_by_libtype_dt.m[value > 0], aes(x = variable, y = value, color = Class)) +
+  ggbeeswarm::geom_quasirandom(shape = 16, alpha = 0.8) +
+  stat_summary(
+    fun = median,
+    fun.min = median,
+    fun.max = median,
+    geom = "crossbar",
+    width = 0.5,
+    color = "red"
+  ) +
+  scale_color_manual(values = te_pal) +
+  scale_y_continuous(labels = \(x) 2^x) +
+  facet_wrap(~Class, nrow = 1) +
+  labs(x = "Inferred Library Type", y = "Count-per-million (CPM)") +
+  guides(color = "none") +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.text = element_text(size = 16, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+ggsave(here(figures, "controls-expression-by-class.pdf"), width = 16, height = 4, bg = "white")
+```
+
+Show the results of the pairwise Wilcox tests as a heatmap
+
+```{r}
+wc_tests <- runWilcoxTests(lcpm_by_libtype_dt.m[value > 0])
+
+ggplot(wc_tests, aes(x = Var1, y = Var2, fill = statistic)) +
+  geom_tile(color = "white", size = 0.5) +
+  geom_text(aes(label = ifelse(p_adj < 0.05, "*", "")), color = "black", size = 6, vjust = 0.75) +
+  facet_wrap(~Class, nrow = 1) +
+  scale_fill_gradientn(
+    colors = c("#FDE725FF", "#21908CFF", "#440154FF"),
+    name = "Test Statistic\n(Effect Size)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold", size = 12)
+  ) +
+  labs(
+    title = "Pairwise Wilcoxon Tests by Class",
+    subtitle = "Asterisks (*) indicate significant difference (Bonferroni-adjusted p < 0.05)",
+    x = NULL,
+    y = NULL
+  )
+ggsave(here(figures, "controls-wc-test-significance.pdf"), width = 11, height = 6, bg = "white")
+```
+
+### Examine by detectability
+
+```{r}
+cpms <- edgeR::cpm(assay(se, "counts"))
+
+# Convert to a binary matrix
+detected <- (cpms > 1) * 1
+
+# Sum the indicator based on the group membership
+detected_counts <- edgeR::sumTechReps(detected, ID = se$library_types)
+
+# Only care about features that were detected in any
+detected_counts <- detected_counts[rowSums(detected_counts) > 0, ]
+
+# Take the proportions within each
+libtype_counts <- table(se$library_types)[colnames(detected_counts)]
+detected_props <- sweep(detected_counts, 2, libtype_counts, FUN = '/')
+
+# Exclude the single "SF;U" sample
+detected_props <- detected_props[, colnames(detected_props) != "SF;U"]
+
+# Extract only the TE features
+detected_tes <- detected_props[
+  rownames(detected_props) %like% "^LINE\\.|^SINE\\.|^LTR\\.|.*\\.SVA\\..*|^DNA\\.",
+]
+
+# Coerce to a long data.table for plotting
+detected_tes_dt <- as.data.table(detected_tes, keep.rownames = "repElem")
+detected_tes_dt[, c("Class", "Family", "Subfamily") := tstrsplit(repElem, ".", fixed = TRUE)]
+detected_tes_dt.m <- melt(detected_tes_dt, measure.vars = c("IU", "U", "SR", "SF", "ISR", "ISF"))
+
+# Add the count information
+detected_tes_dt.m <- merge(
+  x = detected_tes_dt.m,
+  y = data.table(variable = names(libtype_counts), Counts = as.integer(libtype_counts)),
+  all.x = TRUE,
+  by = "variable"
+)
+detected_tes_dt.m[, label := paste0(variable, "\n(n=", Counts, ")")]
+```
+
+How do I plot this? As a histogram by TE Class maybe?
+
+```{r}
+ggplot(detected_tes_dt.m, aes(x = value)) +
+  geom_histogram(aes(fill = Class), bins = 10, color = "white") +
+  scale_fill_manual(values = te_pal) +
+  geom_hline(yintercept = 0) +
+  facet_grid(Class ~ label, scales = "free_y") +
+  guides(fill = "none") +
+  labs(
+    x = "Proportion of Libraries Where Subfamily is Detected",
+    y = "Number of Detected Subfamilies",
+    fill = NULL
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 16, face = "bold"),
+    strip.background = element_blank()
+  )
+ggsave(here(figures, "controls-detected-prop-by-libtype.pdf"), width = 12, height = 8, bg = "white")
+```
+
+Maybe a parallel coordinates plot would showe this better?
+
+```{r}
+ggplot(detected_tes_dt.m, aes(x = variable, y = value, group = repElem, color = Class)) +
+  geom_line(alpha = 0.2) +
+  scale_color_manual(values = te_pal) +
+  facet_wrap(~Class, ncol = 5) +
+  labs(
+    x = "Library Type",
+    y = "Proportion of Libraries\nWhere Subfamily is Detected",
+    color = NULL
+  ) +
+  guides(color = "none") +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major = element_line(linetype = 3, color = "grey80"),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 16, face = "bold"),
+    axis.ticks = element_line()
+  )
+ggsave(here(figures, "controls-detected-te-parcoord.pdf"), width = 16, height = 4, bg = "white")
+```
+
+Display KS test comparisons as a heatmap
+
+```{r}
+ks_tests <- runKSTests(detected_tes_dt.m)
+
+ggplot(ks_tests, aes(x = Var1, y = Var2, fill = D_statistic)) +
+  geom_tile(color = "white", size = 0.5) +
+  geom_text(aes(label = ifelse(p_adj < 0.05, "*", "")), color = "black", size = 6, vjust = 0.75) +
+  facet_wrap(~Class, nrow = 1) +
+  scale_fill_gradientn(
+    colors = c("#FDE725FF", "#21908CFF", "#440154FF"),
+    name = "D Statistic\n(Effect Size)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold", size = 12)
+  ) +
+  labs(
+    title = "Pairwise Kolmogorov-Smirnov Tests by Class",
+    subtitle = "Asterisks (*) indicate significant difference (Bonferroni-adjusted p < 0.05)",
+    x = NULL,
+    y = NULL
+  )
+ggsave(here(figures, "controls-ks-test-significance.pdf"), width = 11, height = 6, bg = "white")
 ```
 
 ## Map cell types back to BioSamples
