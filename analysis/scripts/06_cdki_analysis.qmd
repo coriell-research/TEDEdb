@@ -378,21 +378,31 @@ lvls <- jack_stats[
   )
 
 jack_stats[, Compound := factor(Compound, levels(lvls))]
+
+# Make a new facet for the combined groups vs the single compounds
+comb <- c("Transcriptional (n=29)", "Cell cycle (n=22)", "Pan-CDK (n=12)")
+jack_stats[, Group := ifelse(Compound %in% comb, "Multi-CDKi", "Single Compound CDKi")]
 ```
 
 Plot the results of the meta-analysis with the SE from the Jackknife estimates
 
 ```{r}
-ggplot(jack_stats, aes(x = Compound, y = Observed, fill = Direction)) +
+p1 <- ggplot(
+  jack_stats[Group == "Single Compound CDKi"],
+  aes(x = Compound, y = Observed, fill = Direction)
+) +
   geom_col(color = "white") +
-  geom_errorbar(data = jack_stats, aes(ymin = Observed - SE, ymax = Observed + SE), width = 0.2) +
-  facet_wrap(~FeatureType) +
+  geom_errorbar(
+    data = jack_stats[Group == "Single Compound CDKi"],
+    aes(ymin = Observed - SE, ymax = Observed + SE),
+    width = 0.2
+  ) +
+  facet_grid(Group ~ FeatureType) +
   scale_fill_manual(
     values = c("Up" = "#E41A1C", "Down" = "#377EB8"),
     labels = c("Up" = "Meta Up-regulated", "Down" = "Meta Down-regulated")
   ) +
   scale_y_continuous(labels = \(x) paste0(abs(x), "%"), n.breaks = 10, limits = c(-100, 100)) +
-  geom_vline(xintercept = 15.5, linetype = 2) +
   coord_flip() +
   labs(
     fill = NULL,
@@ -409,7 +419,37 @@ ggplot(jack_stats, aes(x = Compound, y = Observed, fill = Direction)) +
     panel.grid.major.x = element_line(linetype = 3, color = "grey80"),
     strip.text = element_text(size = 14, face = "bold")
   )
-ggsave(here(figures, "cdki-meta-results-barplot.pdf"), width = 12, height = 6, bg = "white")
+
+p2 <- ggplot(jack_stats[Group == "Multi-CDKi"], aes(x = Compound, y = Observed, fill = Direction)) +
+  geom_col(color = "white") +
+  geom_errorbar(
+    data = jack_stats[Group == "Multi-CDKi"],
+    aes(ymin = Observed - SE, ymax = Observed + SE),
+    width = 0.2
+  ) +
+  facet_grid(Group ~ FeatureType) +
+  scale_fill_manual(
+    values = c("Up" = "#E41A1C", "Down" = "#377EB8"),
+    labels = c("Up" = "Meta Up-regulated", "Down" = "Meta Down-regulated")
+  ) +
+  scale_y_continuous(labels = \(x) paste0(abs(x), "%"), n.breaks = 10, limits = c(-100, 100)) +
+  coord_flip() +
+  labs(fill = NULL, y = NULL, x = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    text = element_text(color = "black"),
+    axis.title = element_text(size = 16),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(linetype = 3, color = "grey80"),
+    strip.text = element_text(size = 14, face = "bold"),
+    aspect.ratio = 0.25
+  )
+
+(p2 / p1) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+ggsave(here(figures, "cdki-meta-results-barplot.pdf"), width = 12, height = 9, bg = "white")
 ```
 
 ## Explore overlapping targets for each compound
